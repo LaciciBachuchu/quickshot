@@ -177,6 +177,7 @@ final class ThumbnailView: NSView, NSDraggingSource {
     let image: NSImage
     var onClose: () -> Void = {}
     var onHover: (Bool) -> Void = { _ in }
+    var onDrag: (Bool) -> Void = { _ in }
     let closeButton = NSButton()
     var mouseDownEvent: NSEvent?
 
@@ -224,6 +225,9 @@ final class ThumbnailView: NSView, NSDraggingSource {
     override func mouseExited(with event: NSEvent) { closeButton.isHidden = true; onHover(false) }
     @objc func closeClicked() { onClose() }
 
+    // 浮窗不是活动窗口，没有这个第一次按下会被吞掉，拖不动
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
     override func mouseDown(with event: NSEvent) { mouseDownEvent = event }
 
     override func mouseDragged(with event: NSEvent) {
@@ -232,8 +236,15 @@ final class ThumbnailView: NSView, NSDraggingSource {
                       event.locationInWindow.y - start.locationInWindow.y)
         guard d > 4 else { return }
         mouseDownEvent = nil
-        let item = NSDraggingItem(pasteboardWriter: file as NSURL)
+        // 同时提供文件和图片数据：Finder/微信/邮件拿文件，其他 App 直接拿图片
+        let pbItem = NSPasteboardItem()
+        pbItem.setString(file.absoluteString, forType: .fileURL)
+        if let png = try? Data(contentsOf: file) { pbItem.setData(png, forType: .png) }
+        if let tiff = image.tiffRepresentation { pbItem.setData(tiff, forType: .tiff) }
+        let item = NSDraggingItem(pasteboardWriter: pbItem)
         item.setDraggingFrame(bounds, contents: image)
+        onDrag(true)
+        window?.alphaValue = 0.3
         beginDraggingSession(with: [item], event: start, source: self)
     }
 
@@ -249,6 +260,8 @@ final class ThumbnailView: NSView, NSDraggingSource {
     }
 
     func draggingSession(_ session: NSDraggingSession, endedAt screenPoint: NSPoint, operation: NSDragOperation) {
+        window?.alphaValue = 1
+        onDrag(false)
         if operation != [] { onClose() }
     }
 }
@@ -256,6 +269,7 @@ final class ThumbnailView: NSView, NSDraggingSource {
 final class ThumbnailPanel {
     let panel: NSPanel
     var timer: Timer?
+    var dragging = false
     var finalFrame: NSRect
     var onDismiss: () -> Void = {}
 
@@ -279,7 +293,14 @@ final class ThumbnailPanel {
         let view = ThumbnailView(file: file, image: image, frame: NSRect(origin: .zero, size: size))
         view.onClose = { [weak self] in self?.dismiss() }
         view.onHover = { [weak self] inside in
-            if inside { self?.timer?.invalidate() } else { self?.startTimer() }
+            guard let self, !self.dragging else { return }
+            if inside { self.timer?.invalidate() } else { self.startTimer() }
+        }
+        // 拖动过程中不能自动收起，否则拖到一半浮窗没了
+        view.onDrag = { [weak self] active in
+            guard let self else { return }
+            self.dragging = active
+            if active { self.timer?.invalidate() } else { self.startTimer() }
         }
         panel.contentView = view
     }
@@ -410,10 +431,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             DispatchQueue.main.async {
                 self.capturing = false
                 guard let data = try? Data(contentsOf: file) else { return }  // 取消时没有文件
+                guard let image = NSImage(data: data) else { return }
+                // 同时放 PNG 和 TIFF：不少 App（Office、部分老程序）只认 TIFF，只放 PNG 会粘贴失败
+                let item = NSPasteboardItem()
+                item.setData(data, forType: .png)
+                if let tiff = image.tiffRepresentation { item.setData(tiff, forType: .tiff) }
                 let pb = NSPasteboard.general
                 pb.clearContents()
-                pb.setData(data, forType: .png)
-                if let image = NSImage(data: data) { self.showThumbnail(file: file, image: image) }
+                pb.writeObjects([item])
+                self.showThumbnail(file: file, image: image)
             }
         }
         do { try task.run() } catch { capturing = false }
