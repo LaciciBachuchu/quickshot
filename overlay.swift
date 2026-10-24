@@ -119,7 +119,9 @@ extension CGRect {
 }
 
 // 遮罩画面：变暗层 + 窗口玻璃轮廓 + 选区框 + 光标旁的玻璃提示
-// 全部用图层/视图移动实现，配合 display link 逐帧弹簧动画，不整屏重绘
+// 性能要点：全部用普通 CALayer 的 frame / border / cornerRadius 实现（GPU 直接合成），
+// 不用 CAShapeLayer（改路径要在 CPU 上整块重新光栅化，4K 屏每帧重画整屏会掉帧）；
+// 弹簧静止后暂停 display link，不空转
 final class OverlayView: NSView {
     weak var controller: SelectionOverlay?
     var start: NSPoint?
@@ -128,25 +130,28 @@ final class OverlayView: NSView {
 
     static let windowRadius: CGFloat = 12   // 窗口圆角
     static let ringWidth: CGFloat = 7       // 玻璃轮廓粗细
+    static let dimColor = NSColor.black.withAlphaComponent(0.18).cgColor
 
     let dimView = NSView()
-    let dim = CAShapeLayer()
+    let dimFrame = CALayer()    // 带圆角“洞”的变暗层：超大边框 + 圆角，洞的内圆角 = cornerRadius - borderWidth
+    let holeFill = CALayer()    // 盖在洞上，窗口轮廓淡出时把洞慢慢补暗，避免整屏闪一下
     let ringGlass = makeGlass(cornerRadius: 0)
-    let ringMask = CAShapeLayer()
+    let ringMask = CALayer()    // 只留一圈边框作为玻璃的遮罩
     let lineView = NSView()
-    let ringLine = CAShapeLayer()
-    let border = CAShapeLayer()
+    let ringLine = CALayer()
+    let ringShade = CALayer()
+    let selBorder = CALayer()
     let sizeLabel = CATextLayer()
     let hint = makeGlass(cornerRadius: 17)
 
     var ring = Spring([0, 0, 0, 0], stiffness: 240, damping: 22)   // 轮廓位置：欠阻尼，切换时有流动回弹
-    var ringAlpha = Spring([0], stiffness: 300, damping: 30)
+    var ringAlpha = Spring([0], stiffness: 260, damping: 30)
     var hintPos = Spring([0, 0], stiffness: 520, damping: 42)      // 提示跟随光标，稍微拖后一点
     var hintAlpha = Spring([0], stiffness: 300, damping: 30)
     var ringShown = false
-    var mouse: NSPoint?
     var link: CADisplayLink?
-    var lastTime: CFTimeInterval = 0
+    var lastRingFrame = CGRect.null
+    var lastHintOrigin = CGPoint(x: -1, y: -1)
 
     override init(frame: NSRect) {
         super.init(frame: frame)
@@ -159,27 +164,26 @@ final class OverlayView: NSView {
         }
         dimView.autoresizingMask = [.width, .height]
         lineView.autoresizingMask = [.width, .height]
-        dim.fillRule = .evenOdd
-        dim.fillColor = NSColor.black.withAlphaComponent(0.18).cgColor
-        dimView.layer!.addSublayer(dim)
 
-        // 玻璃只露出一圈：用环形遮罩挖掉中间
-        ringMask.fillRule = .evenOdd
+        dimFrame.borderColor = OverlayView.dimColor
+        holeFill.backgroundColor = OverlayView.dimColor
+        dimView.layer!.addSublayer(dimFrame)
+        dimView.layer!.addSublayer(holeFill)
+
+        ringMask.borderColor = NSColor.black.cgColor
+        ringMask.borderWidth = OverlayView.ringWidth
+        ringMask.cornerRadius = OverlayView.windowRadius + OverlayView.ringWidth / 2
         ringGlass.layer!.mask = ringMask
-        ringGlass.alphaValue = 0
+        ringGlass.layer!.opacity = 0
 
-        // 轮廓内侧一条细亮线，在白色窗口上也看得清
-        ringLine.fillColor = nil
-        ringLine.strokeColor = NSColor.white.withAlphaComponent(0.95).cgColor
-        ringLine.lineWidth = 1.5
-        ringLine.shadowColor = NSColor.black.cgColor
-        ringLine.shadowOpacity = 0.35
-        ringLine.shadowRadius = 2
-        ringLine.shadowOffset = .zero
-        ringLine.opacity = 0
-        border.fillColor = nil
-        border.strokeColor = NSColor.white.cgColor
-        border.lineWidth = 1
+        // 轮廓内侧一条细亮线 + 再往里一圈淡黑线，白色窗口上也看得清
+        ringLine.borderColor = NSColor.white.withAlphaComponent(0.95).cgColor
+        ringLine.borderWidth = 1.5
+        ringShade.borderColor = NSColor.black.withAlphaComponent(0.25).cgColor
+        ringShade.borderWidth = 1
+        selBorder.borderColor = NSColor.white.cgColor
+        selBorder.borderWidth = 1
+        selBorder.isHidden = true
         sizeLabel.foregroundColor = NSColor.white.cgColor
         sizeLabel.backgroundColor = NSColor.black.withAlphaComponent(0.65).cgColor
         sizeLabel.alignmentMode = .center
@@ -187,11 +191,12 @@ final class OverlayView: NSView {
         sizeLabel.font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .medium)
         sizeLabel.fontSize = 11
         sizeLabel.isHidden = true
-        for l in [ringLine, border, sizeLabel] { lineView.layer!.addSublayer(l) }
+        for l in [ringShade, ringLine, selBorder, sizeLabel] { lineView.layer!.addSublayer(l) }
 
         buildHint()
+        hint.wantsLayer = true
         addSubview(hint)
-        hint.alphaValue = 0
+        hint.layer!.opacity = 0
     }
 
     required init?(coder: NSCoder) { fatalError() }
@@ -221,7 +226,6 @@ final class OverlayView: NSView {
     override func viewDidMoveToWindow() {
         guard let window else { return }
         sizeLabel.contentsScale = window.backingScaleFactor
-        ringLine.contentsScale = window.backingScaleFactor
         if link == nil {
             let l = displayLink(target: self, selector: #selector(tick(_:)))
             l.add(to: .main, forMode: .common)
@@ -234,6 +238,9 @@ final class OverlayView: NSView {
         link?.invalidate()
         link = nil
     }
+
+    // 有东西要动时再开动画循环
+    func kick() { link?.isPaused = false }
 
     var selection: NSRect? {
         guard let start, let current else { return nil }
@@ -249,7 +256,7 @@ final class OverlayView: NSView {
     func hoverChanged() {
         if let h = hovered, let r = localRect(h) {
             ring.target = r.vec
-            if !ringShown || ringAlpha.value[0] < 0.05 {
+            if !ringShown && ringAlpha.value[0] < 0.05 {
                 // 从无到有：从稍大一圈收拢进来
                 ring.value = r.insetBy(dx: -14, dy: -14).vec
                 ring.velocity = [0, 0, 0, 0]
@@ -257,73 +264,92 @@ final class OverlayView: NSView {
             ringShown = true
             ringAlpha.target = [1]
         } else {
+            // 离开窗口（比如移到 Dock）：轮廓留在原地淡出，洞同步慢慢变暗
             ringShown = false
             ringAlpha.target = [0]
         }
+        kick()
     }
 
     @objc func tick(_ l: CADisplayLink) {
         let dt = CGFloat(min(max(l.targetTimestamp - l.timestamp, 1.0 / 240), 1.0 / 30))
-        // 分几小步积分，弹簧更稳
+        // 分两小步积分，弹簧更稳
         for _ in 0..<2 {
             ring.step(dt / 2); ringAlpha.step(dt / 2); hintPos.step(dt / 2); hintAlpha.step(dt / 2)
         }
+        let idle = ring.settled && ringAlpha.settled && hintPos.settled && hintAlpha.settled
+        if idle { ring.snap(); ringAlpha.snap(); hintPos.snap(); hintAlpha.snap() }
         updateLayers()
-    }
-
-    func roundedPath(_ r: CGRect, _ radius: CGFloat) -> CGPath {
-        let rad = max(0, min(radius, r.width / 2, r.height / 2))
-        return CGPath(roundedRect: r, cornerWidth: rad, cornerHeight: rad, transform: nil)
+        if idle { l.isPaused = true }
     }
 
     func updateLayers() {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        dim.frame = bounds
-        let path = CGMutablePath()
-        path.addRect(bounds)
 
         let alpha = max(0, min(1, ringAlpha.value[0]))
         let r = CGRect(vec: ring.value)
         let rw = OverlayView.ringWidth, rad = OverlayView.windowRadius
+
+        // 变暗层的洞：框选时是选区（直角），否则是窗口轮廓（圆角，随轮廓淡出被补暗）
+        let hole: CGRect, holeRadius: CGFloat, holeCover: Float
         if let sel = selection {
-            path.addRect(sel)
-            border.path = CGPath(rect: sel.insetBy(dx: -0.5, dy: -0.5), transform: nil)
+            hole = sel; holeRadius = 0; holeCover = 0
+            selBorder.frame = sel.insetBy(dx: -1, dy: -1)
+            selBorder.isHidden = false
             let text = "\(Int(sel.width)) × \(Int(sel.height))"
-            sizeLabel.string = text
-            let w = (text as NSString).size(withAttributes: [.font: sizeLabel.font as! NSFont]).width + 14
+            if sizeLabel.string as? String != text {
+                sizeLabel.string = text
+                let w = (text as NSString).size(withAttributes: [.font: sizeLabel.font as! NSFont]).width + 14
+                sizeLabel.bounds.size = CGSize(width: w, height: 17)
+            }
             var y = sel.minY - 24
             if y < 4 { y = sel.minY + 4 }
-            sizeLabel.frame = CGRect(x: sel.minX, y: y, width: w, height: 17)
+            sizeLabel.frame.origin = CGPoint(x: sel.minX, y: y)
             sizeLabel.isHidden = false
         } else {
-            border.path = nil
+            hole = r; holeRadius = rad; holeCover = Float(1 - alpha)
+            selBorder.isHidden = true
             sizeLabel.isHidden = true
-            if alpha > 0.01 { path.addPath(roundedPath(r, rad)) }   // 鼠标下的窗口不变暗
         }
-        dim.path = path
+        let big = hypot(bounds.width, bounds.height) + 64   // 边框要比屏幕对角线还宽，才能盖住整屏
+        dimFrame.frame = hole.insetBy(dx: -big, dy: -big)
+        dimFrame.borderWidth = big
+        dimFrame.cornerRadius = big + holeRadius
+        holeFill.frame = hole
+        holeFill.cornerRadius = holeRadius
+        holeFill.opacity = holeCover
 
-        // 玻璃轮廓：外框比窗口大半圈，遮罩只留一圈环
+        // 玻璃轮廓：外框比窗口大半圈，遮罩只留一圈
+        // 直接改图层 frame，不走 NSView.frame（那会触发 AppKit 布局，实测每帧 4~8ms，改图层只要 0.03ms）
         let outer = r.insetBy(dx: -rw / 2, dy: -rw / 2)
-        ringGlass.frame = outer
-        let ringPath = CGMutablePath()
-        let local = CGRect(origin: .zero, size: outer.size)
-        ringPath.addPath(roundedPath(local, rad + rw / 2))
-        ringPath.addPath(roundedPath(local.insetBy(dx: rw, dy: rw), rad - rw / 2))
-        ringMask.frame = local
-        ringMask.path = ringPath
-        ringGlass.alphaValue = alpha
-        ringLine.path = roundedPath(r.insetBy(dx: rw / 2, dy: rw / 2), rad - rw / 2)
-        ringLine.opacity = Float(alpha)
+        if outer != lastRingFrame {
+            lastRingFrame = outer
+            ringGlass.layer!.frame = outer
+            ringMask.frame = CGRect(origin: .zero, size: outer.size)
+            let inner = r.insetBy(dx: rw / 2, dy: rw / 2)
+            ringLine.frame = inner
+            ringLine.cornerRadius = rad - rw / 2
+            ringShade.frame = inner.insetBy(dx: 1.5, dy: 1.5)
+            ringShade.cornerRadius = rad - rw / 2 - 1.5
+        }
+        let ringVisible = Float(selection == nil ? alpha : 0)
+        ringGlass.layer!.opacity = ringVisible
+        ringLine.opacity = ringVisible
+        ringShade.opacity = ringVisible
 
-        // 光标旁的提示：在右下方，靠近屏幕边缘时翻到另一侧
-        hint.frame.origin = NSPoint(x: hintPos.value[0], y: hintPos.value[1])
-        hint.alphaValue = max(0, min(1, hintAlpha.value[0]))
+        // 提示的视图固定在原点，用图层平移来移动（同样避开 AppKit 布局，实测 6.9ms → 0.03ms）
+        let origin = CGPoint(x: hintPos.value[0].rounded(), y: hintPos.value[1].rounded())
+        if origin != lastHintOrigin {
+            lastHintOrigin = origin
+            hint.layer!.setAffineTransform(CGAffineTransform(translationX: origin.x, y: origin.y))
+        }
+        hint.layer!.opacity = Float(max(0, min(1, hintAlpha.value[0])))
         CATransaction.commit()
     }
 
+    // 光标旁的提示：在右下方，靠近屏幕边缘时翻到另一侧
     func moveHint(to p: NSPoint, snap: Bool = false) {
-        mouse = p
         let size = hint.frame.size
         var x = p.x + 18, y = p.y - 22 - size.height
         if x + size.width > bounds.width - 8 { x = p.x - 18 - size.width }
@@ -331,6 +357,7 @@ final class OverlayView: NSView {
         hintPos.target = [x, y]
         if snap || hintAlpha.value[0] < 0.05 { hintPos.snap() }
         hintAlpha.target = [selection == nil ? 1 : 0]
+        kick()
     }
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
@@ -353,7 +380,10 @@ final class OverlayView: NSView {
         moveHint(to: convert(event.locationInWindow, from: nil), snap: true)
     }
 
-    override func mouseExited(with event: NSEvent) { hintAlpha.target = [0] }
+    override func mouseExited(with event: NSEvent) {
+        hintAlpha.target = [0]
+        kick()
+    }
 
     func globalPoint(_ event: NSEvent) -> NSPoint {
         window!.convertPoint(toScreen: convert(event.locationInWindow, from: nil))
@@ -371,6 +401,7 @@ final class OverlayView: NSView {
         current = start
         controller?.clearHover()
         hintAlpha.target = [0]
+        kick()
         updateLayers()
     }
 
