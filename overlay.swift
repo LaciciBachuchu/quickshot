@@ -85,6 +85,28 @@ func setGlassContent(_ glass: NSView, _ content: NSView) {
     }
 }
 
+// 玻璃容器：把里面相邻的玻璃融合在一起并合并渲染（macOS 26+），旧系统就是普通视图
+func makeGlassContainer() -> NSView {
+    if #available(macOS 26.0, *) {
+        let c = NSGlassEffectContainerView()
+        c.spacing = OverlayView.ringWidth
+        let content = NSView()
+        content.wantsLayer = true
+        c.contentView = content
+        return c
+    }
+    return NSView()
+}
+
+func glassContainerContent(_ container: NSView) -> NSView {
+    if #available(macOS 26.0, *), let c = container as? NSGlassEffectContainerView, let content = c.contentView {
+        content.frame = c.bounds
+        content.autoresizingMask = [.width, .height]
+        return content
+    }
+    return container
+}
+
 // 简单的弹簧：数值朝目标“流”过去，略带回弹
 struct Spring {
     var value: [CGFloat]
@@ -119,8 +141,8 @@ extension CGRect {
 }
 
 // 遮罩画面：变暗层 + 窗口玻璃轮廓 + 选区框 + 光标旁的玻璃提示
-// 性能要点：全部用普通 CALayer 的 frame / border / cornerRadius 实现（GPU 直接合成），
-// 不用 CAShapeLayer（改路径要在 CPU 上整块重新光栅化，4K 屏每帧重画整屏会掉帧）；
+// 性能要点：全部用普通 CALayer 的 frame / border 实现（GPU 直接合成），不用 CAShapeLayer（改路径要在 CPU 上重新光栅化）；
+// 变暗层用四块矩形而不是超大圆角边框，玻璃只沿轮廓摆细条（Instruments 实测掉帧 54 → 7）；
 // 弹簧静止后暂停 display link，不空转
 final class OverlayView: NSView {
     weak var controller: SelectionOverlay?
@@ -133,10 +155,12 @@ final class OverlayView: NSView {
     static let dimColor = NSColor.black.withAlphaComponent(0.18).cgColor
 
     let dimView = NSView()
-    let dimFrame = CALayer()    // 带圆角“洞”的变暗层：超大边框 + 圆角，洞的内圆角 = cornerRadius - borderWidth
+    let dimParts = (0..<4).map { _ in CALayer() }   // 洞四周的四块变暗矩形（最便宜的纯色图层）
     let holeFill = CALayer()    // 盖在洞上，窗口轮廓淡出时把洞慢慢补暗，避免整屏闪一下
-    let ringGlass = makeGlass(cornerRadius: 0)
-    let ringMask = CALayer()    // 只留一圈边框作为玻璃的遮罩
+    // 玻璃轮廓 = 四条细玻璃条，放在玻璃容器里：容器把相交的玻璃合并成一个整体并一次性渲染，
+    // GPU 只需要算轮廓那一圈的折射，而不是整个窗口大小的玻璃再用遮罩裁掉
+    let ringGlass = makeGlassContainer()
+    let ringStrips = (0..<4).map { _ in makeGlass(cornerRadius: OverlayView.ringWidth / 2) }
     let lineView = NSView()
     let ringLine = CALayer()
     let ringShade = CALayer()
@@ -144,8 +168,8 @@ final class OverlayView: NSView {
     let sizeLabel = CATextLayer()
     let hint = makeGlass(cornerRadius: 17)
 
-    // 轮廓位置：高刚度弹簧，75ms 走完 90%、约 170ms 完全到位，快但仍能看到“流过去”
-    var ring = Spring([0, 0, 0, 0], stiffness: 1800, damping: 72)
+    // 轮廓位置：高刚度、欠阻尼弹簧，67ms 走完 90%，冲过头约 8% 再弹回，约 0.28 秒停稳
+    var ring = Spring([0, 0, 0, 0], stiffness: 1400, damping: 44)
     var ringAlpha = Spring([0], stiffness: 900, damping: 60)
     var hintPos = Spring([0, 0], stiffness: 0, damping: 0)        // 提示直接贴着光标，不做弹簧，避免拖尾
     var hintAlpha = Spring([0], stiffness: 900, damping: 60)
@@ -166,15 +190,16 @@ final class OverlayView: NSView {
         dimView.autoresizingMask = [.width, .height]
         lineView.autoresizingMask = [.width, .height]
 
-        dimFrame.borderColor = OverlayView.dimColor
-        holeFill.backgroundColor = OverlayView.dimColor
-        dimView.layer!.addSublayer(dimFrame)
-        dimView.layer!.addSublayer(holeFill)
+        for l in dimParts + [holeFill] {
+            l.backgroundColor = OverlayView.dimColor
+            dimView.layer!.addSublayer(l)
+        }
 
-        ringMask.borderColor = NSColor.black.cgColor
-        ringMask.borderWidth = OverlayView.ringWidth
-        ringMask.cornerRadius = OverlayView.windowRadius + OverlayView.ringWidth / 2
-        ringGlass.layer!.mask = ringMask
+        let stripHost = glassContainerContent(ringGlass)
+        for g in ringStrips {
+            g.wantsLayer = true
+            stripHost.addSubview(g)
+        }
         ringGlass.layer!.opacity = 0
 
         // 轮廓内侧一条细亮线 + 再往里一圈淡黑线，白色窗口上也看得清
@@ -294,9 +319,9 @@ final class OverlayView: NSView {
         let rw = OverlayView.ringWidth, rad = OverlayView.windowRadius
 
         // 变暗层的洞：框选时是选区（直角），否则是窗口轮廓（圆角，随轮廓淡出被补暗）
-        let hole: CGRect, holeRadius: CGFloat, holeCover: Float
+        let hole: CGRect, holeCover: Float
         if let sel = selection {
-            hole = sel; holeRadius = 0; holeCover = 0
+            hole = sel; holeCover = 0
             selBorder.frame = sel.insetBy(dx: -1, dy: -1)
             selBorder.isHidden = false
             let text = "\(Int(sel.width)) × \(Int(sel.height))"
@@ -310,25 +335,28 @@ final class OverlayView: NSView {
             sizeLabel.frame.origin = CGPoint(x: sel.minX, y: y)
             sizeLabel.isHidden = false
         } else {
-            hole = r; holeRadius = rad; holeCover = Float(1 - alpha)
+            hole = r; holeCover = Float(1 - alpha)
             selBorder.isHidden = true
             sizeLabel.isHidden = true
         }
-        let big = hypot(bounds.width, bounds.height) + 64   // 边框要比屏幕对角线还宽，才能盖住整屏
-        dimFrame.frame = hole.insetBy(dx: -big, dy: -big)
-        dimFrame.borderWidth = big
-        dimFrame.cornerRadius = big + holeRadius
-        holeFill.frame = hole
-        holeFill.cornerRadius = holeRadius
+        // 洞四周四块：上、下、左、右（洞的四角是直角，窗口圆角外那一点点被玻璃轮廓盖住）
+        let h = hole.intersection(bounds).isNull ? CGRect(x: bounds.midX, y: bounds.midY, width: 0, height: 0) : hole
+        dimParts[0].frame = CGRect(x: 0, y: h.maxY, width: bounds.width, height: max(0, bounds.height - h.maxY))
+        dimParts[1].frame = CGRect(x: 0, y: 0, width: bounds.width, height: max(0, h.minY))
+        dimParts[2].frame = CGRect(x: 0, y: h.minY, width: max(0, h.minX), height: h.height)
+        dimParts[3].frame = CGRect(x: h.maxX, y: h.minY, width: max(0, bounds.width - h.maxX), height: h.height)
+        holeFill.frame = h
         holeFill.opacity = holeCover
 
-        // 玻璃轮廓：外框比窗口大半圈，遮罩只留一圈
+        // 玻璃轮廓：四条玻璃条沿窗口边缘摆放，四角相互重叠，由玻璃容器融合成一圈
         // 直接改图层 frame，不走 NSView.frame（那会触发 AppKit 布局，实测每帧 4~8ms，改图层只要 0.03ms）
         let outer = r.insetBy(dx: -rw / 2, dy: -rw / 2)
         if outer != lastRingFrame {
             lastRingFrame = outer
-            ringGlass.layer!.frame = outer
-            ringMask.frame = CGRect(origin: .zero, size: outer.size)
+            ringStrips[0].layer!.frame = CGRect(x: outer.minX, y: outer.maxY - rw, width: outer.width, height: rw)
+            ringStrips[1].layer!.frame = CGRect(x: outer.minX, y: outer.minY, width: outer.width, height: rw)
+            ringStrips[2].layer!.frame = CGRect(x: outer.minX, y: outer.minY, width: rw, height: outer.height)
+            ringStrips[3].layer!.frame = CGRect(x: outer.maxX - rw, y: outer.minY, width: rw, height: outer.height)
             let inner = r.insetBy(dx: rw / 2, dy: rw / 2)
             ringLine.frame = inner
             ringLine.cornerRadius = rad - rw / 2
