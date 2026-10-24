@@ -2,14 +2,13 @@ import AppKit
 
 // 截图标注窗口：画笔 / 矩形 / 椭圆 / 箭头，每画一笔都会同步到剪贴板并保存回原文件
 
-// 同时放 PNG 和 TIFF：不少 App（Office、部分老程序）只认 TIFF，只放 PNG 会粘贴失败
+// 剪贴板只放 PNG（不放 TIFF：未压缩，整屏截图要几十 MB）
 // 记下最后一次复制的是哪张截图，删除时只清掉自己放进剪贴板的内容
 var clipboardOwner: (file: URL, changeCount: Int)?
 
 func copyToClipboard(png: Data, image: NSImage, file: URL) {
     let item = NSPasteboardItem()
     item.setData(png, forType: .png)
-    if let tiff = image.tiffRepresentation { item.setData(tiff, forType: .tiff) }
     let pb = NSPasteboard.general
     pb.clearContents()
     pb.writeObjects([item])

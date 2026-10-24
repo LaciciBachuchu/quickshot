@@ -76,10 +76,10 @@ final class SettingsController: NSObject, NSWindowDelegate {
 
     init(app: AppDelegate) {
         self.app = app
-        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 360, height: 150),
+        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 440, height: 230),
                           styleMask: [.titled, .closable], backing: .buffered, defer: false)
         super.init()
-        window.title = "快速截图 设置"
+        window.title = "QuickShot 设置"
         window.isReleasedWhenClosed = false
         window.delegate = self
 
@@ -95,7 +95,15 @@ final class SettingsController: NSObject, NSWindowDelegate {
         let row = NSStackView(views: [label, recordButton, reset])
         row.spacing = 8
         recordButton.widthAnchor.constraint(greaterThanOrEqualToConstant: 140).isActive = true
-        let stack = NSStackView(views: [row, hint])
+        let glass = NSButton(checkboxWithTitle: "移动时实时重算玻璃形状", target: self, action: #selector(toggleLiveGlass(_:)))
+        glass.state = UserDefaults.standard.bool(forKey: "liveGlassShape") ? .on : .off
+        let glassNote = NSTextField(wrappingLabelWithString:
+            "关闭（推荐）：移动中拉伸已有的玻璃，背后折射仍是实时的，停稳后再按新尺寸重算，流畅省电。\n打开：每一帧都按真实尺寸重算，边缘高光更准确，但每帧多 4~8ms CPU，快速切换时可能掉帧。")
+        glassNote.textColor = .secondaryLabelColor
+        glassNote.font = .systemFont(ofSize: 11)
+        glassNote.preferredMaxLayoutWidth = 400
+
+        let stack = NSStackView(views: [row, hint, glass, glassNote])
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 12
@@ -106,6 +114,10 @@ final class SettingsController: NSObject, NSWindowDelegate {
             stack.centerYAnchor.constraint(equalTo: window.contentView!.centerYAnchor),
         ])
         refresh()
+    }
+
+    @objc func toggleLiveGlass(_ sender: NSButton) {
+        UserDefaults.standard.set(sender.state == .on, forKey: "liveGlassShape")
     }
 
     func show() {
@@ -242,7 +254,6 @@ final class ThumbnailView: NSView, NSDraggingSource {
         let pbItem = NSPasteboardItem()
         pbItem.setString(file.absoluteString, forType: .fileURL)
         if let png = try? Data(contentsOf: file) { pbItem.setData(png, forType: .png) }
-        if let tiff = image.tiffRepresentation { pbItem.setData(tiff, forType: .tiff) }
         let item = NSDraggingItem(pasteboardWriter: pbItem)
         item.setDraggingFrame(bounds, contents: image)
         onDrag(true)
@@ -384,6 +395,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             hotKey = .default
             registerHotKey()
         }
+        _ = readyOverlay()   // 启动时就建好遮罩并预热，第一次截图也不卡
     }
 
     // 全局快捷键（用 Carbon 注册，不需要辅助功能权限）
@@ -440,7 +452,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(withTitle: "框选截图  \(hotKey.display)", action: #selector(capture), keyEquivalent: "").target = self
         menu.addItem(withTitle: "打开截图文件夹", action: #selector(openFolder), keyEquivalent: "").target = self
         menu.addItem(.separator())
-        menu.addItem(withTitle: "设置快捷键…", action: #selector(openSettings), keyEquivalent: ",").target = self
+        menu.addItem(withTitle: "设置…", action: #selector(openSettings), keyEquivalent: ",").target = self
         let login = menu.addItem(withTitle: "开机自动启动", action: #selector(toggleLogin), keyEquivalent: "")
         login.target = self
         login.state = SMAppService.mainApp.status == .enabled ? .on : .off
@@ -455,20 +467,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     var overlay: SelectionOverlay?
 
+    // 复用同一个遮罩；屏幕布局变了才重建（重建后预热一次）
+    func readyOverlay() -> SelectionOverlay {
+        if let o = overlay, o.matchesScreens { return o }
+        let o = SelectionOverlay()
+        overlay = o
+        o.prewarm()
+        return o
+    }
+
     @objc func capture() {
         guard !capturing else { return }  // 防止重复触发
         capturing = true
         thumbnail?.dismiss()
         // 左键拖选区域 / 右键选窗口，Esc 取消
-        let o = SelectionOverlay { [weak self] target in
+        registerEsc()
+        readyOverlay().begin { [weak self] target in
             guard let self else { return }
-            self.overlay = nil
             self.unregisterEsc()
             if let target { self.shoot(target) } else { self.capturing = false }
         }
-        overlay = o
-        registerEsc()
-        o.show()
     }
 
     func shoot(_ target: CaptureTarget) {

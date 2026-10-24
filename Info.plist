@@ -1,7 +1,8 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
-<key>CFBundleName</key><string>快速截图</string>
+<key>CFBundleName</key><string>QuickShot</string>
+<key>CFBundleDisplayName</key><string>QuickShot</string>
 <key>CFBundleIdentifier</key><string>local.thomas.quickshot</string>
 <key>CFBundleExecutable</key><string>quickshot</string>
 <key>CFBundlePackageType</key><string>APPL</string>

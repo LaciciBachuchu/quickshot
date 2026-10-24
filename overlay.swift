@@ -106,6 +106,15 @@ struct Spring {
         }
     }
 
+    // 减速曲线（指数趋近）：一开始速度最快，越接近目标越慢，不会冲过头；tau 越小越快
+    mutating func ease(_ dt: CGFloat, tau: CGFloat) {
+        let k = 1 - exp(-dt / tau)
+        for i in value.indices {
+            value[i] += (target[i] - value[i]) * k
+            velocity[i] = 0
+        }
+    }
+
     mutating func snap() { value = target; velocity = velocity.map { _ in 0 } }
 
     var settled: Bool {
@@ -129,8 +138,8 @@ final class OverlayView: NSView {
     var hovered: WindowInfo? { didSet { if hovered?.id != oldValue?.id { hoverChanged() } } }
 
     static let windowRadius: CGFloat = 12   // 窗口圆角
-    // 玻璃轮廓粗细：太细（7pt）看不出折射和高光，只像一条灰线；玻璃开销按面积算，14pt 一圈仍远小于整窗玻璃
-    static let ringWidth: CGFloat = 14
+    // 玻璃轮廓粗细：太细（7pt）看不出折射和高光，只像一条灰线；14pt 偏粗，取 9pt
+    static let ringWidth: CGFloat = 9
 
     // 玻璃轮廓 = 一整块玻璃 + 环形遮罩：只有一块所以没有拼接缝（多块玻璃拼接处各自有边缘高光，一定会断）
     static let ringRadius = windowRadius + ringWidth / 2   // 外圈圆角；内圈 = 外圈 - 粗细，正好贴合窗口圆角
@@ -142,8 +151,9 @@ final class OverlayView: NSView {
     let sizeLabel = CATextLayer()
     let hint = makeGlass(cornerRadius: 17)
 
-    // 轮廓位置：高刚度、欠阻尼弹簧，67ms 走完 90%，冲过头约 8% 再弹回，约 0.28 秒停稳
-    var ring = Spring([0, 0, 0, 0], stiffness: 1400, damping: 44)
+    // 轮廓位置：减速曲线，起步最快、到位前慢下来，不回弹；约 100ms 走完 90%，200ms 基本停稳
+    var ring = Spring([0, 0, 0, 0], stiffness: 0, damping: 0)
+    static let ringTau: CGFloat = 0.045
     var ringAlpha = Spring([0], stiffness: 900, damping: 60)
     var hintPos = Spring([0, 0], stiffness: 0, damping: 0)        // 提示直接贴着光标，不做弹簧，避免拖尾
     var hintAlpha = Spring([0], stiffness: 900, damping: 60)
@@ -227,9 +237,26 @@ final class OverlayView: NSView {
         updateLayers()
     }
 
-    func stop() {
-        link?.invalidate()
-        link = nil
+    func pause() { link?.isPaused = true }
+
+    // 每次截图开始前回到初始状态（轮廓、提示都隐藏，选区清空）；玻璃视图保留上次的尺寸，不用重建
+    func reset() {
+        start = nil
+        current = nil
+        hovered = nil
+        ringShown = false
+        ringAlpha.value = [0]; ringAlpha.target = [0]
+        hintAlpha.value = [0]; hintAlpha.target = [0]
+        lastHintOrigin = CGPoint(x: -1, y: -1)
+        updateLayers()
+        pause()
+    }
+
+    // 预热：在屏幕中间放一个轮廓和提示，让玻璃完整渲染几帧
+    func warmUp() {
+        let r = CGRect(x: bounds.midX - 400, y: bounds.midY - 250, width: 800, height: 500)
+        hovered = WindowInfo(id: 0, frame: toCG(window!.convertToScreen(r)))
+        moveHint(to: NSPoint(x: bounds.midX, y: bounds.midY))
     }
 
     // 有东西要动时再开动画循环
@@ -253,6 +280,14 @@ final class OverlayView: NSView {
                 // 从无到有：从稍大一圈收拢进来
                 ring.value = r.insetBy(dx: -14, dy: -14).vec
                 ring.velocity = [0, 0, 0, 0]
+                // 玻璃直接按真实尺寸建好（否则会从一个很小的初始尺寸被放大，圆角被拉成巨大的椭圆，直到第一次停稳才恢复）
+                let start = CGRect(vec: ring.value).insetBy(dx: -OverlayView.ringWidth / 2, dy: -OverlayView.ringWidth / 2)
+                // 玻璃已经有合理尺寸（预热过/用过）就只用变换摆过去，省掉一次 4~8ms 的视图布局
+                CATransaction.begin()
+                CATransaction.setDisableActions(true)
+                if ringPiece.frame.width < 40 || ringPiece.frame.height < 40 { settleRing(start) } else { placeRing(start) }
+                CATransaction.commit()
+                lastRingFrame = start
             }
             ringShown = true
             ringAlpha.target = [1]
@@ -265,10 +300,15 @@ final class OverlayView: NSView {
     }
 
     @objc func tick(_ l: CADisplayLink) {
+        if let p = pendingMouse, let win = window {
+            pendingMouse = nil
+            controller?.hover(at: win.convertPoint(toScreen: p))
+            moveHint(to: p, commit: false)
+        }
         let dt = CGFloat(min(max(l.targetTimestamp - l.timestamp, 1.0 / 240), 1.0 / 30))
         // 分两小步积分，弹簧更稳
         for _ in 0..<2 {
-            ring.step(dt / 2); ringAlpha.step(dt / 2); hintPos.step(dt / 2); hintAlpha.step(dt / 2)
+            ring.ease(dt / 2, tau: OverlayView.ringTau); ringAlpha.step(dt / 2); hintPos.step(dt / 2); hintAlpha.step(dt / 2)
         }
         let idle = ring.settled && ringAlpha.settled && hintPos.settled && hintAlpha.settled
         if idle { ring.snap(); ringAlpha.snap(); hintPos.snap(); hintAlpha.snap() }
@@ -282,7 +322,14 @@ final class OverlayView: NSView {
     // 把玻璃放到目标位置 d：
     // 移动中不改视图 frame（会触发 AppKit 布局，每次 4~8ms），而是给玻璃图层加“拉伸 + 平移”变换，
     // 同时给遮罩加反向缩放，抵消拉伸，所以露出来的那一圈粗细、圆角始终准确
+    // 设置里的开关：移动中每帧都按真实尺寸重算玻璃形状（更精确，但每帧多 4~8ms CPU，可能掉帧）
+    static var liveGlassShape: Bool { UserDefaults.standard.bool(forKey: "liveGlassShape") }
+
     func placeRing(_ d: CGRect) {
+        if OverlayView.liveGlassShape {
+            settleRing(d)
+            return
+        }
         guard let layer = ringPiece.layer else { return }
         let f = ringPiece.frame
         if f.width < 1 || f.height < 1 || d.width < 1 || d.height < 1 {
@@ -343,7 +390,7 @@ final class OverlayView: NSView {
 
         // 玻璃轮廓：外框比窗口大半圈（骑在窗口边缘上），移动中用变换，停稳后 settleGlass 设真实 frame
         let outer = r.insetBy(dx: -rw / 2, dy: -rw / 2)
-        if outer != lastRingFrame {
+        if (ringShown || alpha > 0.01) && outer != lastRingFrame {   // 还没出现过时不摆放（此时没有有效位置）
             lastRingFrame = outer
             placeRing(outer)
         }
@@ -360,7 +407,8 @@ final class OverlayView: NSView {
     }
 
     // 光标旁的提示：在右下方，靠近屏幕边缘时翻到另一侧
-    func moveHint(to p: NSPoint) {
+    // 光标旁提示的位置；commit = false 时只记目标，由下一帧 tick 统一提交
+    func moveHint(to p: NSPoint, commit: Bool = true) {
         let size = hint.frame.size
         var x = p.x + 18, y = p.y - 22 - size.height
         if x + size.width > bounds.width - 8 { x = p.x - 18 - size.width }
@@ -369,6 +417,7 @@ final class OverlayView: NSView {
         hintPos.target = [x, y]
         hintPos.snap()
         hintAlpha.target = [selection == nil ? 1 : 0]
+        guard commit else { return }
         updateLayers()
         if !hintAlpha.settled { kick() }
     }
@@ -402,10 +451,14 @@ final class OverlayView: NSView {
         window!.convertPoint(toScreen: convert(event.locationInWindow, from: nil))
     }
 
+    // 鼠标事件比屏幕刷新还频繁（触控板/高回报率鼠标一帧能来好几次），
+    // 这里只记下位置，等下一帧统一处理一次，避免每个事件都重新查窗口、提交一次图层
+    var pendingMouse: NSPoint?
+
     override func mouseMoved(with event: NSEvent) {
         NSCursor.crosshair.set()
-        controller?.hover(at: globalPoint(event))
-        moveHint(to: convert(event.locationInWindow, from: nil))
+        pendingMouse = convert(event.locationInWindow, from: nil)
+        kick()
     }
 
     override func mouseDown(with event: NSEvent) {
@@ -447,16 +500,18 @@ final class OverlayView: NSView {
     }
 }
 
+// 截图遮罩：App 启动时建好并预热一次，之后每次截图复用
+// （每次新建窗口和玻璃视图，头 0.2 秒每帧要 10~30ms 做初始化，Instruments 里掉帧几乎都集中在这里）
 final class SelectionOverlay {
     var windows: [OverlayPanel] = []
     var views: [OverlayView] = []
-    let targets: [WindowInfo]
-    let completion: (CaptureTarget?) -> Void
-    var finished = false
+    var targets: [WindowInfo] = []
+    var completion: ((CaptureTarget?) -> Void)?
+    var finished = true          // true = 当前没有在截图
+    let screenFrames: [NSRect]
 
-    init(completion: @escaping (CaptureTarget?) -> Void) {
-        targets = visibleWindows()   // 遮罩出现前先记下窗口位置
-        self.completion = completion
+    init() {
+        screenFrames = NSScreen.screens.map(\.frame)
         for screen in NSScreen.screens {
             let w = OverlayPanel(contentRect: screen.frame, styleMask: [.borderless, .nonactivatingPanel],
                                  backing: .buffered, defer: false)
@@ -477,6 +532,40 @@ final class SelectionOverlay {
             windows.append(w)
             views.append(v)
         }
+    }
+
+    // 屏幕布局变了（接/拔显示器、改分辨率）就要重建
+    var matchesScreens: Bool { NSScreen.screens.map(\.frame) == screenFrames }
+
+    // 预热：用几乎看不见、不接收鼠标的状态把玻璃轮廓和提示完整渲染几帧
+    func prewarm() {
+        for w in windows {
+            w.alphaValue = 0.01
+            w.ignoresMouseEvents = true
+            w.orderFrontRegardless()
+        }
+        views.forEach { $0.warmUp() }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+            guard self.finished else { return }   // 预热期间已经开始截图了，就不收起
+            for w in self.windows {
+                w.orderOut(nil)
+                w.alphaValue = 1
+                w.ignoresMouseEvents = false
+            }
+            self.views.forEach { $0.reset() }
+        }
+    }
+
+    func begin(completion: @escaping (CaptureTarget?) -> Void) {
+        targets = visibleWindows()   // 遮罩出现前先记下窗口位置
+        self.completion = completion
+        finished = false
+        for w in windows {
+            w.alphaValue = 1
+            w.ignoresMouseEvents = false
+        }
+        views.forEach { $0.reset() }
+        show()
     }
 
     func show() {
@@ -519,17 +608,15 @@ final class SelectionOverlay {
         guard !finished else { return }
         finished = true
         for w in windows { w.orderOut(nil) }
-        views.forEach { $0.stop() }
+        views.forEach { $0.pause() }
         NSCursor.arrow.set()
+        let done = completion
+        completion = nil
         guard target != nil else {
-            windows.forEach { $0.close() }
-            completion(nil)
+            done?(nil)
             return
         }
-        // 等遮罩真正从屏幕上消失再截图，否则会把半透明遮罩也截进去
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
-            self.windows.forEach { $0.close() }
-            self.completion(target)
-        }
+        // 等遮罩真正从屏幕上消失再截图，否则会把遮罩也截进去
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) { done?(target) }
     }
 }
