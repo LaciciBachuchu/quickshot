@@ -2,7 +2,7 @@ import AppKit
 import ServiceManagement
 import Carbon.HIToolbox
 
-// 菜单栏截图：左键点图标或按快捷键（默认 ⌘⇧2）→ 直接拖动框选截图；右键 → 菜单
+// 菜单栏截图：左键点图标或按快捷键（默认 ⌘⇧2）→ 左键拖动框选 / 右键单击截取窗口；菜单栏图标右键 → 菜单
 // 截完右下角弹出缩略图：点击打开标注窗口（改动实时同步到剪贴板），可直接拖进微信/邮件等，几秒后自动消失
 
 // MARK: - 快捷键
@@ -419,10 +419,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     var capturing = false
 
+    var overlay: SelectionOverlay?
+
     @objc func capture() {
         guard !capturing else { return }  // 防止重复触发
         capturing = true
         thumbnail?.dismiss()
+        // 左键拖选区域 / 右键选窗口，Esc 取消
+        let o = SelectionOverlay { [weak self] target in
+            guard let self else { return }
+            self.overlay = nil
+            if let target { self.shoot(target) } else { self.capturing = false }
+        }
+        overlay = o
+        o.show()
+    }
+
+    func shoot(_ target: CaptureTarget) {
         try? FileManager.default.createDirectory(at: saveDir, withIntermediateDirectories: true)
         let fmt = DateFormatter()
         fmt.dateFormat = "yyyy-MM-dd HH.mm.ss"
@@ -430,7 +443,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let task = Process()
         task.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
-        task.arguments = ["-i", file.path]  // -i: 十字光标拖选，松手即截；Esc 取消
+        switch target {
+        case .region(let r):
+            task.arguments = ["-R\(Int(r.minX.rounded())),\(Int(r.minY.rounded())),\(Int(r.width.rounded())),\(Int(r.height.rounded()))", file.path]
+        case .window(let id):
+            task.arguments = ["-o", "-l\(id)", file.path]   // -o: 不带窗口阴影
+        }
         task.terminationHandler = { _ in
             DispatchQueue.main.async {
                 self.capturing = false
