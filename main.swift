@@ -436,7 +436,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.capturing = false
                 guard let data = try? Data(contentsOf: file) else { return }  // 取消时没有文件
                 guard let image = NSImage(data: data) else { return }
-                copyToClipboard(png: data, image: image)
+                copyToClipboard(png: data, image: image, file: file)
                 self.showThumbnail(file: file, image: image)
             }
         }

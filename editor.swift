@@ -3,13 +3,17 @@ import AppKit
 // 截图标注窗口：画笔 / 矩形 / 椭圆 / 箭头，每画一笔都会同步到剪贴板并保存回原文件
 
 // 同时放 PNG 和 TIFF：不少 App（Office、部分老程序）只认 TIFF，只放 PNG 会粘贴失败
-func copyToClipboard(png: Data, image: NSImage) {
+// 记下最后一次复制的是哪张截图，删除时只清掉自己放进剪贴板的内容
+var clipboardOwner: (file: URL, changeCount: Int)?
+
+func copyToClipboard(png: Data, image: NSImage, file: URL) {
     let item = NSPasteboardItem()
     item.setData(png, forType: .png)
     if let tiff = image.tiffRepresentation { item.setData(tiff, forType: .tiff) }
     let pb = NSPasteboard.general
     pb.clearContents()
     pb.writeObjects([item])
+    clipboardOwner = (file, pb.changeCount)
 }
 
 enum Tool: Int { case pen, rect, ellipse, arrow }
@@ -260,7 +264,15 @@ final class EditorController: NSObject, NSWindowDelegate {
 
         let spacer = NSView()
         spacer.setContentHuggingPriority(.init(1), for: .horizontal)
-        let bar = NSStackView(views: [tools, colorRow, width, undo, spacer, preview, done])
+        let trash = NSButton(image: NSImage(systemSymbolName: "trash", accessibilityDescription: "删除")!,
+                             target: self, action: #selector(deleteClicked))
+        trash.bezelStyle = .rounded
+        trash.contentTintColor = .systemRed
+        trash.keyEquivalent = "\u{8}"   // ⌘⌫
+        trash.keyEquivalentModifierMask = .command
+        trash.toolTip = "删除这张截图 ⌘⌫（移到废纸篓）"
+
+        let bar = NSStackView(views: [tools, colorRow, width, undo, spacer, trash, preview, done])
         bar.spacing = 12
         bar.edgeInsets = NSEdgeInsets(top: 0, left: 12, bottom: 0, right: 12)
 
@@ -294,7 +306,7 @@ final class EditorController: NSObject, NSWindowDelegate {
             return
         }
         try? png.write(to: file, options: .atomic)
-        copyToClipboard(png: png, image: img)
+        copyToClipboard(png: png, image: img, file: file)
         window.subtitle = "✓ 已同步到剪贴板"
     }
 
@@ -311,6 +323,17 @@ final class EditorController: NSObject, NSWindowDelegate {
     @objc func undoClicked() { canvas.undo() }
     @objc func openInPreview() { NSWorkspace.shared.open(file) }
     @objc func doneClicked() { window.close() }
+
+    // 删除：文件移到废纸篓（可恢复），剪贴板里还是这张图的话一并清掉
+    @objc func deleteClicked() {
+        try? FileManager.default.trashItem(at: file, resultingItemURL: nil)
+        let pb = NSPasteboard.general
+        if let owner = clipboardOwner, owner.file == file, owner.changeCount == pb.changeCount {
+            pb.clearContents()
+            clipboardOwner = nil
+        }
+        window.close()
+    }
 
     func windowWillClose(_ notification: Notification) { onClose() }
 }
