@@ -144,10 +144,11 @@ final class OverlayView: NSView {
     let sizeLabel = CATextLayer()
     let hint = makeGlass(cornerRadius: 17)
 
-    var ring = Spring([0, 0, 0, 0], stiffness: 240, damping: 22)   // 轮廓位置：欠阻尼，切换时有流动回弹
-    var ringAlpha = Spring([0], stiffness: 260, damping: 30)
-    var hintPos = Spring([0, 0], stiffness: 520, damping: 42)      // 提示跟随光标，稍微拖后一点
-    var hintAlpha = Spring([0], stiffness: 300, damping: 30)
+    // 轮廓位置：高刚度弹簧，75ms 走完 90%、约 170ms 完全到位，快但仍能看到“流过去”
+    var ring = Spring([0, 0, 0, 0], stiffness: 1800, damping: 72)
+    var ringAlpha = Spring([0], stiffness: 900, damping: 60)
+    var hintPos = Spring([0, 0], stiffness: 0, damping: 0)        // 提示直接贴着光标，不做弹簧，避免拖尾
+    var hintAlpha = Spring([0], stiffness: 900, damping: 60)
     var ringShown = false
     var link: CADisplayLink?
     var lastRingFrame = CGRect.null
@@ -228,6 +229,7 @@ final class OverlayView: NSView {
         sizeLabel.contentsScale = window.backingScaleFactor
         if link == nil {
             let l = displayLink(target: self, selector: #selector(tick(_:)))
+            l.preferredFrameRateRange = CAFrameRateRange(minimum: 60, maximum: 120, preferred: 120)  // ProMotion 屏跑满 120Hz
             l.add(to: .main, forMode: .common)
             link = l
         }
@@ -349,15 +351,17 @@ final class OverlayView: NSView {
     }
 
     // 光标旁的提示：在右下方，靠近屏幕边缘时翻到另一侧
-    func moveHint(to p: NSPoint, snap: Bool = false) {
+    func moveHint(to p: NSPoint) {
         let size = hint.frame.size
         var x = p.x + 18, y = p.y - 22 - size.height
         if x + size.width > bounds.width - 8 { x = p.x - 18 - size.width }
         if y < 8 { y = p.y + 22 }
+        // 位置直接跟到光标（同一帧立刻生效），只有淡入淡出走动画
         hintPos.target = [x, y]
-        if snap || hintAlpha.value[0] < 0.05 { hintPos.snap() }
+        hintPos.snap()
         hintAlpha.target = [selection == nil ? 1 : 0]
-        kick()
+        updateLayers()
+        if !hintAlpha.settled { kick() }
     }
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
@@ -377,7 +381,7 @@ final class OverlayView: NSView {
 
     override func mouseEntered(with event: NSEvent) {
         NSCursor.crosshair.set()
-        moveHint(to: convert(event.locationInWindow, from: nil), snap: true)
+        moveHint(to: convert(event.locationInWindow, from: nil))
     }
 
     override func mouseExited(with event: NSEvent) {
@@ -391,8 +395,8 @@ final class OverlayView: NSView {
 
     override func mouseMoved(with event: NSEvent) {
         NSCursor.crosshair.set()
-        moveHint(to: convert(event.locationInWindow, from: nil))
         controller?.hover(at: globalPoint(event))
+        moveHint(to: convert(event.locationInWindow, from: nil))
     }
 
     override func mouseDown(with event: NSEvent) {
@@ -476,7 +480,7 @@ final class SelectionOverlay {
         NSCursor.crosshair.set()
         for v in views {
             if let w = v.window, NSMouseInRect(mouse, w.frame, false) {
-                v.moveHint(to: w.convertPoint(fromScreen: mouse), snap: true)
+                v.moveHint(to: w.convertPoint(fromScreen: mouse))
             }
         }
         hover(at: mouse)
