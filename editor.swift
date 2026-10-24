@@ -168,29 +168,50 @@ final class EditorController: NSObject, NSWindowDelegate {
     let colors: [NSColor] = [.systemRed, .systemYellow, .systemGreen, .systemBlue, .black, .white]
     var colorButtons: [NSButton] = []
     let widths: [CGFloat] = [2, 4, 8]
-    let status = NSTextField(labelWithString: "")
 
     init(file: URL, image: NSImage) {
         self.file = file
         canvas = CanvasView(image: image)
 
-        let screen = NSScreen.screens.first { NSMouseInRect(NSEvent.mouseLocation, $0.frame, false) } ?? NSScreen.main!
-        let vf = screen.visibleFrame
-        let barH: CGFloat = 48
-        let s = min(1, vf.width * 0.85 / image.size.width, (vf.height * 0.85 - barH) / image.size.height)
-        let size = NSSize(width: max(image.size.width * s, 640), height: max(image.size.height * s, 200) + barH)
-        window = EditorWindow(contentRect: NSRect(origin: .zero, size: size),
+        window = EditorWindow(contentRect: NSRect(x: 0, y: 0, width: 640, height: 400),
                               styleMask: [.titled, .closable, .resizable, .miniaturizable],
                               backing: .buffered, defer: false)
         super.init()
         window.title = "标注 — \(file.lastPathComponent)"
         window.isReleasedWhenClosed = false
         window.delegate = self
-        window.minSize = NSSize(width: 640, height: 260)
 
         canvas.onChange = { [weak self] in self?.sync() }
-        buildUI(barHeight: barH)
-        status.stringValue = "画完自动复制到剪贴板"
+        buildUI(barHeight: barHeight)
+        window.subtitle = "画完自动复制到剪贴板"
+        fitToImage()
+    }
+
+    let barHeight: CGFloat = 48
+    var aspect: CGFloat { canvas.image.size.height / canvas.image.size.width }
+    var minCanvasWidth: CGFloat = 0
+
+    // 画布严格按图片比例，不留黑边；图片比工具栏窄时放大显示（导出仍是原图分辨率）
+    func fitToImage() {
+        let screen = NSScreen.screens.first { NSMouseInRect(NSEvent.mouseLocation, $0.frame, false) } ?? NSScreen.main!
+        let vf = screen.visibleFrame
+        let titleH = window.frame.height - window.contentLayoutRect.height
+        let maxW = vf.width * 0.9, maxH = vf.height * 0.9 - barHeight - titleH
+        minCanvasWidth = min(window.contentView!.subviews.first!.fittingSize.width, maxW)
+
+        let img = canvas.image.size
+        var w = min(img.width, maxW, maxH / aspect)   // 默认原尺寸，太大就缩小
+        w = max(w, minCanvasWidth)                     // 太窄就放大到工具栏宽度
+        let h = min(w * aspect, maxH)                  // 极端细长图才会在左右留边
+        window.setContentSize(NSSize(width: w, height: h + barHeight))
+        window.contentMinSize = NSSize(width: minCanvasWidth, height: min(minCanvasWidth * aspect, maxH) + barHeight)
+    }
+
+    // 拖动改变窗口大小时保持图片比例
+    func windowWillResize(_ sender: NSWindow, to frameSize: NSSize) -> NSSize {
+        let titleH = sender.frame.height - sender.contentLayoutRect.height
+        let w = max(frameSize.width, minCanvasWidth)
+        return NSSize(width: w, height: w * aspect + barHeight + titleH)
     }
 
     func buildUI(barHeight: CGFloat) {
@@ -229,25 +250,22 @@ final class EditorController: NSObject, NSWindowDelegate {
         undo.keyEquivalentModifierMask = .command
         undo.toolTip = "撤销 ⌘Z"
 
-        status.textColor = .secondaryLabelColor
-        status.font = .systemFont(ofSize: 11)
-        status.lineBreakMode = .byTruncatingTail
-        status.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-
-        let preview = NSButton(title: "用预览打开", target: self, action: #selector(openInPreview))
+        let preview = NSButton(image: NSImage(systemSymbolName: "arrow.up.forward.app", accessibilityDescription: "用预览打开")!,
+                               target: self, action: #selector(openInPreview))
         preview.bezelStyle = .rounded
+        preview.toolTip = "用预览打开"
         let done = NSButton(title: "完成", target: self, action: #selector(doneClicked))
         done.bezelStyle = .rounded
         done.keyEquivalent = "\r"
 
         let spacer = NSView()
         spacer.setContentHuggingPriority(.init(1), for: .horizontal)
-        let bar = NSStackView(views: [tools, colorRow, width, undo, spacer, status, preview, done])
+        let bar = NSStackView(views: [tools, colorRow, width, undo, spacer, preview, done])
         bar.spacing = 12
         bar.edgeInsets = NSEdgeInsets(top: 0, left: 12, bottom: 0, right: 12)
 
         let content = window.contentView!
-        for v in [bar, canvas] as [NSView] {
+        for v in [bar, canvas] as [NSView] {   // bar 必须是第一个子视图，fitToImage 用它算最小宽度
             v.translatesAutoresizingMaskIntoConstraints = false
             content.addSubview(v)
         }
@@ -272,12 +290,12 @@ final class EditorController: NSObject, NSWindowDelegate {
     // 每次修改：合成新图 → 写回原文件 → 复制到剪贴板
     func sync() {
         guard let png = canvas.renderPNG(), let img = NSImage(data: png) else {
-            status.stringValue = "合成失败"
+            window.subtitle = "合成失败"
             return
         }
         try? png.write(to: file, options: .atomic)
         copyToClipboard(png: png, image: img)
-        status.stringValue = "✓ 已同步到剪贴板"
+        window.subtitle = "✓ 已同步到剪贴板"
     }
 
     func highlightColor(_ index: Int) {
