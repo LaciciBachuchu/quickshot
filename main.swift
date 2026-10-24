@@ -3,7 +3,7 @@ import ServiceManagement
 import Carbon.HIToolbox
 
 // 菜单栏截图：左键点图标或按快捷键（默认 ⌘⇧2）→ 直接拖动框选截图；右键 → 菜单
-// 截完右下角弹出缩略图：点击用预览打开，可直接拖进微信/邮件等，几秒后自动消失
+// 截完右下角弹出缩略图：点击打开标注窗口（改动实时同步到剪贴板），可直接拖进微信/邮件等，几秒后自动消失
 
 // MARK: - 快捷键
 
@@ -176,6 +176,7 @@ final class ThumbnailView: NSView, NSDraggingSource {
     let file: URL
     let image: NSImage
     var onClose: () -> Void = {}
+    var onClick: () -> Void = {}
     var onHover: (Bool) -> Void = { _ in }
     var onDrag: (Bool) -> Void = { _ in }
     let closeButton = NSButton()
@@ -251,7 +252,7 @@ final class ThumbnailView: NSView, NSDraggingSource {
     override func mouseUp(with event: NSEvent) {
         guard mouseDownEvent != nil else { return }
         mouseDownEvent = nil
-        NSWorkspace.shared.open(file)   // 单击：用默认程序（预览）打开，可标注
+        onClick()   // 单击：打开标注窗口
         onClose()
     }
 
@@ -272,6 +273,7 @@ final class ThumbnailPanel {
     var dragging = false
     var finalFrame: NSRect
     var onDismiss: () -> Void = {}
+    var onClick: () -> Void = {}
 
     init(file: URL, image: NSImage) {
         let screen = NSScreen.screens.first { NSMouseInRect(NSEvent.mouseLocation, $0.frame, false) } ?? NSScreen.main!
@@ -292,6 +294,7 @@ final class ThumbnailPanel {
 
         let view = ThumbnailView(file: file, image: image, frame: NSRect(origin: .zero, size: size))
         view.onClose = { [weak self] in self?.dismiss() }
+        view.onClick = { [weak self] in self?.onClick() }
         view.onHover = { [weak self] inside in
             guard let self, !self.dragging else { return }
             if inside { self.timer?.invalidate() } else { self.startTimer() }
@@ -349,6 +352,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var hotKey = HotKey.load()
     var hotKeyRef: EventHotKeyRef?
     var thumbnail: ThumbnailPanel?
+    var editors: [EditorController] = []
     lazy var settings = SettingsController(app: self)
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -432,13 +436,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.capturing = false
                 guard let data = try? Data(contentsOf: file) else { return }  // 取消时没有文件
                 guard let image = NSImage(data: data) else { return }
-                // 同时放 PNG 和 TIFF：不少 App（Office、部分老程序）只认 TIFF，只放 PNG 会粘贴失败
-                let item = NSPasteboardItem()
-                item.setData(data, forType: .png)
-                if let tiff = image.tiffRepresentation { item.setData(tiff, forType: .tiff) }
-                let pb = NSPasteboard.general
-                pb.clearContents()
-                pb.writeObjects([item])
+                copyToClipboard(png: data, image: image)
                 self.showThumbnail(file: file, image: image)
             }
         }
@@ -450,8 +448,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         t.onDismiss = { [weak self, weak t] in
             if self?.thumbnail === t { self?.thumbnail = nil }
         }
+        t.onClick = { [weak self] in self?.openEditor(file: file, image: image) }
         thumbnail = t
         t.show()
+    }
+
+    func openEditor(file: URL, image: NSImage) {
+        let e = EditorController(file: file, image: image)
+        e.onClose = { [weak self, weak e] in self?.editors.removeAll { $0 === e } }
+        editors.append(e)
+        e.show()
     }
 
     @objc func openSettings() { settings.show() }

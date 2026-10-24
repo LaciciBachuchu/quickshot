@@ -5,7 +5,7 @@ cd "$(dirname "$0")"
 APP="$HOME/Applications/快速截图.app"
 mkdir -p "$APP/Contents/MacOS"
 cp Info.plist "$APP/Contents/Info.plist"
-swiftc -O -o "$APP/Contents/MacOS/quickshot.new" main.swift
+swiftc -O -o "$APP/Contents/MacOS/quickshot.new" *.swift
 pkill -f "快速截图.app/Contents/MacOS/quickshot" 2>/dev/null || true
 mv "$APP/Contents/MacOS/quickshot.new" "$APP/Contents/MacOS/quickshot"
 codesign --force -s - "$APP"
