@@ -57,45 +57,182 @@ final class OverlayPanel: NSPanel {
     override var canBecomeKey: Bool { true }
 }
 
-// 用图层绘制（GPU 合成），拖动时只改路径，不重绘整屏，所以不卡
+// 液态玻璃视图（macOS 26+ 原生 NSGlassEffectView，旧系统退回毛玻璃）
+func makeGlass(cornerRadius: CGFloat) -> NSView {
+    if #available(macOS 26.0, *) {
+        let g = NSGlassEffectView()
+        g.cornerRadius = cornerRadius
+        g.style = .regular
+        return g
+    }
+    let v = NSVisualEffectView()
+    v.material = .hudWindow
+    v.blendingMode = .behindWindow
+    v.state = .active
+    v.wantsLayer = true
+    v.layer?.cornerRadius = cornerRadius
+    v.layer?.masksToBounds = true
+    return v
+}
+
+func setGlassContent(_ glass: NSView, _ content: NSView) {
+    if #available(macOS 26.0, *), let g = glass as? NSGlassEffectView {
+        g.contentView = content
+    } else {
+        content.frame = glass.bounds
+        content.autoresizingMask = [.width, .height]
+        glass.addSubview(content)
+    }
+}
+
+// 简单的弹簧：数值朝目标“流”过去，略带回弹
+struct Spring {
+    var value: [CGFloat]
+    var velocity: [CGFloat]
+    var target: [CGFloat]
+    let stiffness: CGFloat
+    let damping: CGFloat
+
+    init(_ v: [CGFloat], stiffness: CGFloat, damping: CGFloat) {
+        value = v; target = v; velocity = Array(repeating: 0, count: v.count)
+        self.stiffness = stiffness; self.damping = damping
+    }
+
+    mutating func step(_ dt: CGFloat) {
+        for i in value.indices {
+            let force = stiffness * (target[i] - value[i]) - damping * velocity[i]
+            velocity[i] += force * dt
+            value[i] += velocity[i] * dt
+        }
+    }
+
+    mutating func snap() { value = target; velocity = velocity.map { _ in 0 } }
+
+    var settled: Bool {
+        value.indices.allSatisfy { abs(target[$0] - value[$0]) < 0.3 && abs(velocity[$0]) < 0.3 }
+    }
+}
+
+extension CGRect {
+    var vec: [CGFloat] { [minX, minY, width, height] }
+    init(vec v: [CGFloat]) { self.init(x: v[0], y: v[1], width: max(v[2], 0), height: max(v[3], 0)) }
+}
+
+// 遮罩画面：变暗层 + 窗口玻璃轮廓 + 选区框 + 光标旁的玻璃提示
+// 全部用图层/视图移动实现，配合 display link 逐帧弹簧动画，不整屏重绘
 final class OverlayView: NSView {
     weak var controller: SelectionOverlay?
     var start: NSPoint?
     var current: NSPoint?
-    var hovered: WindowInfo? { didSet { if hovered?.id != oldValue?.id { refresh() } } }
+    var hovered: WindowInfo? { didSet { if hovered?.id != oldValue?.id { hoverChanged() } } }
 
+    static let windowRadius: CGFloat = 12   // 窗口圆角
+    static let ringWidth: CGFloat = 7       // 玻璃轮廓粗细
+
+    let dimView = NSView()
     let dim = CAShapeLayer()
+    let ringGlass = makeGlass(cornerRadius: 0)
+    let ringMask = CAShapeLayer()
+    let lineView = NSView()
+    let ringLine = CAShapeLayer()
     let border = CAShapeLayer()
     let sizeLabel = CATextLayer()
-    let hint = CATextLayer()
+    let hint = makeGlass(cornerRadius: 17)
+
+    var ring = Spring([0, 0, 0, 0], stiffness: 240, damping: 22)   // 轮廓位置：欠阻尼，切换时有流动回弹
+    var ringAlpha = Spring([0], stiffness: 300, damping: 30)
+    var hintPos = Spring([0, 0], stiffness: 520, damping: 42)      // 提示跟随光标，稍微拖后一点
+    var hintAlpha = Spring([0], stiffness: 300, damping: 30)
+    var ringShown = false
+    var mouse: NSPoint?
+    var link: CADisplayLink?
+    var lastTime: CFTimeInterval = 0
 
     override init(frame: NSRect) {
         super.init(frame: frame)
         wantsLayer = true
+
+        for v in [dimView, ringGlass, lineView] {
+            v.frame = bounds
+            v.wantsLayer = true
+            addSubview(v)
+        }
+        dimView.autoresizingMask = [.width, .height]
+        lineView.autoresizingMask = [.width, .height]
         dim.fillRule = .evenOdd
         dim.fillColor = NSColor.black.withAlphaComponent(0.18).cgColor
-        border.lineWidth = 2
-        for l in [sizeLabel, hint] {
-            l.foregroundColor = NSColor.white.cgColor
-            l.backgroundColor = NSColor.black.withAlphaComponent(0.65).cgColor
-            l.alignmentMode = .center
-            l.cornerRadius = 6
-        }
+        dimView.layer!.addSublayer(dim)
+
+        // 玻璃只露出一圈：用环形遮罩挖掉中间
+        ringMask.fillRule = .evenOdd
+        ringGlass.layer!.mask = ringMask
+        ringGlass.alphaValue = 0
+
+        // 轮廓内侧一条细亮线，在白色窗口上也看得清
+        ringLine.fillColor = nil
+        ringLine.strokeColor = NSColor.white.withAlphaComponent(0.95).cgColor
+        ringLine.lineWidth = 1.5
+        ringLine.shadowColor = NSColor.black.cgColor
+        ringLine.shadowOpacity = 0.35
+        ringLine.shadowRadius = 2
+        ringLine.shadowOffset = .zero
+        ringLine.opacity = 0
+        border.fillColor = nil
+        border.strokeColor = NSColor.white.cgColor
+        border.lineWidth = 1
+        sizeLabel.foregroundColor = NSColor.white.cgColor
+        sizeLabel.backgroundColor = NSColor.black.withAlphaComponent(0.65).cgColor
+        sizeLabel.alignmentMode = .center
+        sizeLabel.cornerRadius = 5
         sizeLabel.font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .medium)
         sizeLabel.fontSize = 11
-        hint.font = NSFont.systemFont(ofSize: 13, weight: .medium)
-        hint.fontSize = 13
-        hint.string = "左键拖动框选　·　右键截取窗口　·　Esc 取消"
-        for l in [dim, border, sizeLabel, hint] { layer!.addSublayer(l) }
+        sizeLabel.isHidden = true
+        for l in [ringLine, border, sizeLabel] { lineView.layer!.addSublayer(l) }
+
+        buildHint()
+        addSubview(hint)
+        hint.alphaValue = 0
     }
 
     required init?(coder: NSCoder) { fatalError() }
 
+    func buildHint() {
+        func item(_ symbol: String, _ text: String) -> NSView {
+            let icon = NSImageView(image: NSImage(systemSymbolName: symbol, accessibilityDescription: nil)!)
+            icon.symbolConfiguration = .init(pointSize: 12, weight: .semibold)
+            icon.contentTintColor = .labelColor
+            let label = NSTextField(labelWithString: text)
+            label.font = .systemFont(ofSize: 12, weight: .semibold)
+            label.textColor = .labelColor
+            let s = NSStackView(views: [icon, label])
+            s.spacing = 5
+            return s
+        }
+        let dot = NSTextField(labelWithString: "·")
+        dot.textColor = .secondaryLabelColor
+        let row = NSStackView(views: [item("rectangle.dashed", "左键框选范围"), dot, item("macwindow", "右键截取窗口")])
+        row.spacing = 8
+        row.edgeInsets = NSEdgeInsets(top: 0, left: 14, bottom: 0, right: 14)
+        let size = row.fittingSize
+        hint.frame = NSRect(x: 0, y: 0, width: size.width, height: 34)
+        setGlassContent(hint, row)
+    }
+
     override func viewDidMoveToWindow() {
-        let scale = window?.backingScaleFactor ?? 2
-        sizeLabel.contentsScale = scale
-        hint.contentsScale = scale
-        refresh()
+        guard let window else { return }
+        sizeLabel.contentsScale = window.backingScaleFactor
+        ringLine.contentsScale = window.backingScaleFactor
+        if link == nil {
+            let l = displayLink(target: self, selector: #selector(tick(_:)))
+            l.add(to: .main, forMode: .common)
+            link = l
+        }
+        updateLayers()
+    }
+
+    func stop() {
+        link?.invalidate()
+        link = nil
     }
 
     var selection: NSRect? {
@@ -104,20 +241,54 @@ final class OverlayView: NSView {
                       width: abs(current.x - start.x), height: abs(current.y - start.y))
     }
 
-    func refresh() {
+    func localRect(_ w: WindowInfo) -> NSRect? {
+        guard let win = window else { return nil }
+        return convert(win.convertFromScreen(toCocoa(w.frame)), from: nil)
+    }
+
+    func hoverChanged() {
+        if let h = hovered, let r = localRect(h) {
+            ring.target = r.vec
+            if !ringShown || ringAlpha.value[0] < 0.05 {
+                // 从无到有：从稍大一圈收拢进来
+                ring.value = r.insetBy(dx: -14, dy: -14).vec
+                ring.velocity = [0, 0, 0, 0]
+            }
+            ringShown = true
+            ringAlpha.target = [1]
+        } else {
+            ringShown = false
+            ringAlpha.target = [0]
+        }
+    }
+
+    @objc func tick(_ l: CADisplayLink) {
+        let dt = CGFloat(min(max(l.targetTimestamp - l.timestamp, 1.0 / 240), 1.0 / 30))
+        // 分几小步积分，弹簧更稳
+        for _ in 0..<2 {
+            ring.step(dt / 2); ringAlpha.step(dt / 2); hintPos.step(dt / 2); hintAlpha.step(dt / 2)
+        }
+        updateLayers()
+    }
+
+    func roundedPath(_ r: CGRect, _ radius: CGFloat) -> CGPath {
+        let rad = max(0, min(radius, r.width / 2, r.height / 2))
+        return CGPath(roundedRect: r, cornerWidth: rad, cornerHeight: rad, transform: nil)
+    }
+
+    func updateLayers() {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         dim.frame = bounds
         let path = CGMutablePath()
         path.addRect(bounds)
-        sizeLabel.isHidden = true
-        hint.isHidden = selection != nil
+
+        let alpha = max(0, min(1, ringAlpha.value[0]))
+        let r = CGRect(vec: ring.value)
+        let rw = OverlayView.ringWidth, rad = OverlayView.windowRadius
         if let sel = selection {
             path.addRect(sel)
-            border.path = CGPath(rect: sel.insetBy(dx: -1, dy: -1), transform: nil)
-            border.strokeColor = NSColor.white.cgColor
-            border.fillColor = nil
-            border.lineWidth = 1
+            border.path = CGPath(rect: sel.insetBy(dx: -0.5, dy: -0.5), transform: nil)
             let text = "\(Int(sel.width)) × \(Int(sel.height))"
             sizeLabel.string = text
             let w = (text as NSString).size(withAttributes: [.font: sizeLabel.font as! NSFont]).width + 14
@@ -125,19 +296,41 @@ final class OverlayView: NSView {
             if y < 4 { y = sel.minY + 4 }
             sizeLabel.frame = CGRect(x: sel.minX, y: y, width: w, height: 17)
             sizeLabel.isHidden = false
-        } else if let h = hovered, let win = window {
-            let local = convert(win.convertFromScreen(toCocoa(h.frame)), from: nil)
-            border.path = CGPath(rect: local.insetBy(dx: 1, dy: 1), transform: nil)
-            border.strokeColor = NSColor.systemBlue.cgColor
-            border.fillColor = NSColor.systemBlue.withAlphaComponent(0.15).cgColor
-            border.lineWidth = 2
         } else {
             border.path = nil
+            sizeLabel.isHidden = true
+            if alpha > 0.01 { path.addPath(roundedPath(r, rad)) }   // 鼠标下的窗口不变暗
         }
         dim.path = path
-        let hintW = ((hint.string as? String ?? "") as NSString).size(withAttributes: [.font: hint.font as! NSFont]).width + 28
-        hint.frame = CGRect(x: (bounds.width - hintW) / 2, y: 60, width: hintW, height: 26)
+
+        // 玻璃轮廓：外框比窗口大半圈，遮罩只留一圈环
+        let outer = r.insetBy(dx: -rw / 2, dy: -rw / 2)
+        ringGlass.frame = outer
+        let ringPath = CGMutablePath()
+        let local = CGRect(origin: .zero, size: outer.size)
+        ringPath.addPath(roundedPath(local, rad + rw / 2))
+        ringPath.addPath(roundedPath(local.insetBy(dx: rw, dy: rw), rad - rw / 2))
+        ringMask.frame = local
+        ringMask.path = ringPath
+        ringGlass.alphaValue = alpha
+        ringLine.path = roundedPath(r.insetBy(dx: rw / 2, dy: rw / 2), rad - rw / 2)
+        ringLine.opacity = Float(alpha)
+
+        // 光标旁的提示：在右下方，靠近屏幕边缘时翻到另一侧
+        hint.frame.origin = NSPoint(x: hintPos.value[0], y: hintPos.value[1])
+        hint.alphaValue = max(0, min(1, hintAlpha.value[0]))
         CATransaction.commit()
+    }
+
+    func moveHint(to p: NSPoint, snap: Bool = false) {
+        mouse = p
+        let size = hint.frame.size
+        var x = p.x + 18, y = p.y - 22 - size.height
+        if x + size.width > bounds.width - 8 { x = p.x - 18 - size.width }
+        if y < 8 { y = p.y + 22 }
+        hintPos.target = [x, y]
+        if snap || hintAlpha.value[0] < 0.05 { hintPos.snap() }
+        hintAlpha.target = [selection == nil ? 1 : 0]
     }
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
@@ -154,7 +347,13 @@ final class OverlayView: NSView {
 
     // 每次鼠标动都重新设一次，防止光标被别的 App 换回箭头
     override func cursorUpdate(with event: NSEvent) { NSCursor.crosshair.set() }
-    override func mouseEntered(with event: NSEvent) { NSCursor.crosshair.set() }
+
+    override func mouseEntered(with event: NSEvent) {
+        NSCursor.crosshair.set()
+        moveHint(to: convert(event.locationInWindow, from: nil), snap: true)
+    }
+
+    override func mouseExited(with event: NSEvent) { hintAlpha.target = [0] }
 
     func globalPoint(_ event: NSEvent) -> NSPoint {
         window!.convertPoint(toScreen: convert(event.locationInWindow, from: nil))
@@ -162,6 +361,7 @@ final class OverlayView: NSView {
 
     override func mouseMoved(with event: NSEvent) {
         NSCursor.crosshair.set()
+        moveHint(to: convert(event.locationInWindow, from: nil))
         controller?.hover(at: globalPoint(event))
     }
 
@@ -170,13 +370,14 @@ final class OverlayView: NSView {
         start = convert(event.locationInWindow, from: nil)
         current = start
         controller?.clearHover()
-        refresh()
+        hintAlpha.target = [0]
+        updateLayers()
     }
 
     override func mouseDragged(with event: NSEvent) {
         NSCursor.crosshair.set()
         current = convert(event.locationInWindow, from: nil)
-        refresh()
+        updateLayers()
     }
 
     override func mouseUp(with event: NSEvent) {
@@ -184,8 +385,9 @@ final class OverlayView: NSView {
         start = nil
         current = nil
         guard let sel, sel.width >= 4, sel.height >= 4 else {   // 只是点了一下，不算
-            refresh()
+            moveHint(to: convert(event.locationInWindow, from: nil))
             controller?.hover(at: globalPoint(event))
+            updateLayers()
             return
         }
         let global = window!.convertToScreen(convert(sel, to: nil))
@@ -241,6 +443,11 @@ final class SelectionOverlay {
         key?.makeKeyAndOrderFront(nil)
         key?.makeFirstResponder(key?.contentView)
         NSCursor.crosshair.set()
+        for v in views {
+            if let w = v.window, NSMouseInRect(mouse, w.frame, false) {
+                v.moveHint(to: w.convertPoint(fromScreen: mouse), snap: true)
+            }
+        }
         hover(at: mouse)
     }
 
@@ -267,6 +474,7 @@ final class SelectionOverlay {
         guard !finished else { return }
         finished = true
         for w in windows { w.orderOut(nil) }
+        views.forEach { $0.stop() }
         NSCursor.arrow.set()
         guard target != nil else {
             windows.forEach { $0.close() }
