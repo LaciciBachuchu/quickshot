@@ -41,20 +41,103 @@ func visibleWindows() -> [WindowInfo] {
     }
 }
 
-final class OverlayWindow: NSWindow {
+// 让本程序在后台时也能设置光标（否则别的 App 在前台时光标会被换回箭头）
+// 这是系统私有接口，找不到就跳过
+func allowCursorInBackground() {
+    typealias MainConn = @convention(c) () -> Int32
+    typealias SetProp = @convention(c) (Int32, Int32, CFString, CFTypeRef) -> Int32
+    let h = UnsafeMutableRawPointer(bitPattern: -2)   // RTLD_DEFAULT
+    guard let c = dlsym(h, "_CGSDefaultConnection"), let s = dlsym(h, "CGSSetConnectionProperty") else { return }
+    let cid = unsafeBitCast(c, to: MainConn.self)()
+    _ = unsafeBitCast(s, to: SetProp.self)(cid, cid, "SetsCursorInBackground" as CFString, kCFBooleanTrue)
+}
+
+// 不激活本程序也能成为 key window、接收键盘
+final class OverlayPanel: NSPanel {
     override var canBecomeKey: Bool { true }
 }
 
+// 用图层绘制（GPU 合成），拖动时只改路径，不重绘整屏，所以不卡
 final class OverlayView: NSView {
     weak var controller: SelectionOverlay?
     var start: NSPoint?
     var current: NSPoint?
-    var hovered: WindowInfo?
+    var hovered: WindowInfo? { didSet { if hovered?.id != oldValue?.id { refresh() } } }
+
+    let dim = CAShapeLayer()
+    let border = CAShapeLayer()
+    let sizeLabel = CATextLayer()
+    let hint = CATextLayer()
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true
+        dim.fillRule = .evenOdd
+        dim.fillColor = NSColor.black.withAlphaComponent(0.18).cgColor
+        border.lineWidth = 2
+        for l in [sizeLabel, hint] {
+            l.foregroundColor = NSColor.white.cgColor
+            l.backgroundColor = NSColor.black.withAlphaComponent(0.65).cgColor
+            l.alignmentMode = .center
+            l.cornerRadius = 6
+        }
+        sizeLabel.font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .medium)
+        sizeLabel.fontSize = 11
+        hint.font = NSFont.systemFont(ofSize: 13, weight: .medium)
+        hint.fontSize = 13
+        hint.string = "左键拖动框选　·　右键截取窗口　·　Esc 取消"
+        for l in [dim, border, sizeLabel, hint] { layer!.addSublayer(l) }
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func viewDidMoveToWindow() {
+        let scale = window?.backingScaleFactor ?? 2
+        sizeLabel.contentsScale = scale
+        hint.contentsScale = scale
+        refresh()
+    }
 
     var selection: NSRect? {
         guard let start, let current else { return nil }
         return NSRect(x: min(start.x, current.x), y: min(start.y, current.y),
                       width: abs(current.x - start.x), height: abs(current.y - start.y))
+    }
+
+    func refresh() {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        dim.frame = bounds
+        let path = CGMutablePath()
+        path.addRect(bounds)
+        sizeLabel.isHidden = true
+        hint.isHidden = selection != nil
+        if let sel = selection {
+            path.addRect(sel)
+            border.path = CGPath(rect: sel.insetBy(dx: -1, dy: -1), transform: nil)
+            border.strokeColor = NSColor.white.cgColor
+            border.fillColor = nil
+            border.lineWidth = 1
+            let text = "\(Int(sel.width)) × \(Int(sel.height))"
+            sizeLabel.string = text
+            let w = (text as NSString).size(withAttributes: [.font: sizeLabel.font as! NSFont]).width + 14
+            var y = sel.minY - 24
+            if y < 4 { y = sel.minY + 4 }
+            sizeLabel.frame = CGRect(x: sel.minX, y: y, width: w, height: 17)
+            sizeLabel.isHidden = false
+        } else if let h = hovered, let win = window {
+            let local = convert(win.convertFromScreen(toCocoa(h.frame)), from: nil)
+            border.path = CGPath(rect: local.insetBy(dx: 1, dy: 1), transform: nil)
+            border.strokeColor = NSColor.systemBlue.cgColor
+            border.fillColor = NSColor.systemBlue.withAlphaComponent(0.15).cgColor
+            border.lineWidth = 2
+        } else {
+            border.path = nil
+        }
+        dim.path = path
+        let hintW = ((hint.string as? String ?? "") as NSString).size(withAttributes: [.font: hint.font as! NSFont]).width + 28
+        hint.frame = CGRect(x: (bounds.width - hintW) / 2, y: 60, width: hintW, height: 26)
+        CATransaction.commit()
     }
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
@@ -64,30 +147,44 @@ final class OverlayView: NSView {
 
     override func updateTrackingAreas() {
         trackingAreas.forEach(removeTrackingArea)
-        addTrackingArea(NSTrackingArea(rect: bounds, options: [.mouseMoved, .activeAlways, .inVisibleRect],
+        addTrackingArea(NSTrackingArea(rect: bounds, options: [.mouseMoved, .mouseEnteredAndExited, .activeAlways,
+                                                               .cursorUpdate, .inVisibleRect],
                                        owner: self, userInfo: nil))
     }
+
+    // 每次鼠标动都重新设一次，防止光标被别的 App 换回箭头
+    override func cursorUpdate(with event: NSEvent) { NSCursor.crosshair.set() }
+    override func mouseEntered(with event: NSEvent) { NSCursor.crosshair.set() }
 
     func globalPoint(_ event: NSEvent) -> NSPoint {
         window!.convertPoint(toScreen: convert(event.locationInWindow, from: nil))
     }
 
-    override func mouseMoved(with event: NSEvent) { controller?.hover(at: globalPoint(event)) }
+    override func mouseMoved(with event: NSEvent) {
+        NSCursor.crosshair.set()
+        controller?.hover(at: globalPoint(event))
+    }
 
     override func mouseDown(with event: NSEvent) {
+        NSCursor.crosshair.set()
         start = convert(event.locationInWindow, from: nil)
         current = start
         controller?.clearHover()
+        refresh()
     }
 
     override func mouseDragged(with event: NSEvent) {
+        NSCursor.crosshair.set()
         current = convert(event.locationInWindow, from: nil)
-        needsDisplay = true
+        refresh()
     }
 
     override func mouseUp(with event: NSEvent) {
-        defer { start = nil; current = nil; needsDisplay = true }
-        guard let sel = selection, sel.width >= 4, sel.height >= 4 else {   // 只是点了一下，不算
+        let sel = selection
+        start = nil
+        current = nil
+        guard let sel, sel.width >= 4, sel.height >= 4 else {   // 只是点了一下，不算
+            refresh()
             controller?.hover(at: globalPoint(event))
             return
         }
@@ -102,60 +199,10 @@ final class OverlayView: NSView {
     override func keyDown(with event: NSEvent) {
         if event.keyCode == 53 { controller?.finish(nil) }   // Esc
     }
-
-    override func draw(_ dirtyRect: NSRect) {
-        // 轻微变暗，选中部分 / 鼠标下的窗口保持原样
-        NSColor.black.withAlphaComponent(0.18).setFill()
-        bounds.fill()
-
-        if let sel = selection {
-            NSColor.clear.setFill()
-            sel.fill(using: .copy)
-            NSColor.white.setStroke()
-            let border = NSBezierPath(rect: sel.insetBy(dx: -0.5, dy: -0.5))
-            border.lineWidth = 1
-            border.stroke()
-            drawLabel("\(Int(sel.width)) × \(Int(sel.height))", near: sel)
-        } else if let w = hovered, let win = window {
-            let local = convert(win.convertFromScreen(toCocoa(w.frame)), from: nil)
-            NSColor.systemBlue.withAlphaComponent(0.18).setFill()
-            local.fill(using: .copy)
-            NSColor.systemBlue.setStroke()
-            let border = NSBezierPath(rect: local.insetBy(dx: 1, dy: 1))
-            border.lineWidth = 2
-            border.stroke()
-        }
-
-        if selection == nil {
-            drawHint("左键拖动框选　·　右键截取窗口　·　Esc 取消")
-        }
-    }
-
-    func drawLabel(_ text: String, near rect: NSRect) {
-        let attrs: [NSAttributedString.Key: Any] = [.font: NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .medium),
-                                                    .foregroundColor: NSColor.white]
-        let size = text.size(withAttributes: attrs)
-        var origin = NSPoint(x: rect.minX, y: rect.minY - size.height - 8)
-        if origin.y < 4 { origin.y = rect.minY + 4 }
-        let bg = NSRect(x: origin.x, y: origin.y, width: size.width + 10, height: size.height + 4)
-        NSColor.black.withAlphaComponent(0.7).setFill()
-        NSBezierPath(roundedRect: bg, xRadius: 4, yRadius: 4).fill()
-        text.draw(at: NSPoint(x: bg.minX + 5, y: bg.minY + 2), withAttributes: attrs)
-    }
-
-    func drawHint(_ text: String) {
-        let attrs: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: 13, weight: .medium),
-                                                    .foregroundColor: NSColor.white]
-        let size = text.size(withAttributes: attrs)
-        let bg = NSRect(x: (bounds.width - size.width) / 2 - 14, y: 60, width: size.width + 28, height: size.height + 14)
-        NSColor.black.withAlphaComponent(0.6).setFill()
-        NSBezierPath(roundedRect: bg, xRadius: 8, yRadius: 8).fill()
-        text.draw(at: NSPoint(x: bg.minX + 14, y: bg.minY + 7), withAttributes: attrs)
-    }
 }
 
 final class SelectionOverlay {
-    var windows: [OverlayWindow] = []
+    var windows: [OverlayPanel] = []
     var views: [OverlayView] = []
     let targets: [WindowInfo]
     let completion: (CaptureTarget?) -> Void
@@ -165,13 +212,16 @@ final class SelectionOverlay {
         targets = visibleWindows()   // 遮罩出现前先记下窗口位置
         self.completion = completion
         for screen in NSScreen.screens {
-            let w = OverlayWindow(contentRect: screen.frame, styleMask: .borderless, backing: .buffered, defer: false)
+            let w = OverlayPanel(contentRect: screen.frame, styleMask: [.borderless, .nonactivatingPanel],
+                                 backing: .buffered, defer: false)
             w.level = NSWindow.Level(rawValue: Int(CGShieldingWindowLevel()))
             w.isOpaque = false
             w.backgroundColor = .clear
             w.hasShadow = false
             w.ignoresMouseEvents = false
             w.acceptsMouseMovedEvents = true
+            w.becomesKeyOnlyIfNeeded = false
+            w.hidesOnDeactivate = false
             w.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
             w.isReleasedWhenClosed = false
             let v = OverlayView(frame: NSRect(origin: .zero, size: screen.frame.size))
@@ -183,13 +233,14 @@ final class SelectionOverlay {
     }
 
     func show() {
-        NSApp.activate(ignoringOtherApps: true)
+        allowCursorInBackground()
         for w in windows { w.orderFrontRegardless() }
-        // 鼠标所在屏幕的遮罩接收键盘（Esc）
+        // 鼠标所在屏幕的遮罩接收键盘（Esc）；面板不需要激活本程序也能拿到键盘
         let mouse = NSEvent.mouseLocation
         let key = windows.first { NSMouseInRect(mouse, $0.frame, false) } ?? windows.first
-        key?.makeKey()
+        key?.makeKeyAndOrderFront(nil)
         key?.makeFirstResponder(key?.contentView)
+        NSCursor.crosshair.set()
         hover(at: mouse)
     }
 
@@ -200,14 +251,11 @@ final class SelectionOverlay {
 
     func hover(at point: NSPoint) {
         let w = window(at: point)
-        for v in views where v.hovered?.id != w?.id {
-            v.hovered = w
-            v.needsDisplay = true
-        }
+        for v in views { v.hovered = w }
     }
 
     func clearHover() {
-        for v in views { v.hovered = nil; v.needsDisplay = true }
+        for v in views { v.hovered = nil }
     }
 
     func pickWindow(at point: NSPoint) {
@@ -219,8 +267,14 @@ final class SelectionOverlay {
         guard !finished else { return }
         finished = true
         for w in windows { w.orderOut(nil) }
+        NSCursor.arrow.set()
+        guard target != nil else {
+            windows.forEach { $0.close() }
+            completion(nil)
+            return
+        }
         // 等遮罩真正从屏幕上消失再截图，否则会把半透明遮罩也截进去
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
             self.windows.forEach { $0.close() }
             self.completion(target)
         }

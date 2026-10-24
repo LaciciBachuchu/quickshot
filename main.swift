@@ -177,6 +177,7 @@ final class ThumbnailView: NSView, NSDraggingSource {
     let image: NSImage
     var onClose: () -> Void = {}
     var onClick: () -> Void = {}
+    var onDelete: () -> Void = {}
     var onHover: (Bool) -> Void = { _ in }
     var onDrag: (Bool) -> Void = { _ in }
     let closeButton = NSButton()
@@ -249,6 +250,18 @@ final class ThumbnailView: NSView, NSDraggingSource {
         beginDraggingSession(with: [item], event: start, source: self)
     }
 
+    // 右键：在旁边弹出「删除」确认，点了才删
+    override func rightMouseDown(with event: NSEvent) {
+        let menu = NSMenu()
+        let item = menu.addItem(withTitle: "删除这张截图", action: #selector(deleteConfirmed), keyEquivalent: "")
+        item.target = self
+        item.image = NSImage(systemSymbolName: "trash", accessibilityDescription: nil)
+        menu.addItem(withTitle: "取消", action: nil, keyEquivalent: "")
+        menu.popUp(positioning: item, at: convert(event.locationInWindow, from: nil), in: self)
+    }
+
+    @objc func deleteConfirmed() { onDelete() }
+
     override func mouseUp(with event: NSEvent) {
         guard mouseDownEvent != nil else { return }
         mouseDownEvent = nil
@@ -295,6 +308,10 @@ final class ThumbnailPanel {
         let view = ThumbnailView(file: file, image: image, frame: NSRect(origin: .zero, size: size))
         view.onClose = { [weak self] in self?.dismiss() }
         view.onClick = { [weak self] in self?.onClick() }
+        view.onDelete = { [weak self] in
+            trashScreenshot(file)
+            self?.dismiss()
+        }
         view.onHover = { [weak self] inside in
             guard let self, !self.dragging else { return }
             if inside { self.timer?.invalidate() } else { self.startTimer() }
@@ -372,9 +389,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // 全局快捷键（用 Carbon 注册，不需要辅助功能权限）
     func installHotKeyHandler() {
         var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
-        InstallEventHandler(GetApplicationEventTarget(), { _, _, userData in
+        InstallEventHandler(GetApplicationEventTarget(), { _, event, userData in
+            var hk = EventHotKeyID()
+            GetEventParameter(event, EventParamName(kEventParamDirectObject), EventParamType(typeEventHotKeyID),
+                              nil, MemoryLayout<EventHotKeyID>.size, nil, &hk)
             let me = Unmanaged<AppDelegate>.fromOpaque(userData!).takeUnretainedValue()
-            DispatchQueue.main.async { me.capture() }
+            DispatchQueue.main.async {
+                if hk.id == 2 { me.overlay?.finish(nil) } else { me.capture() }
+            }
             return noErr
         }, 1, &spec, Unmanaged.passUnretained(self).toOpaque(), nil)
     }
@@ -385,6 +407,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let id = EventHotKeyID(signature: OSType(0x51534854), id: 1)  // 'QSHT'
         return RegisterEventHotKey(hotKey.keyCode, hotKey.modifiers, id,
                                    GetApplicationEventTarget(), 0, &hotKeyRef) == noErr
+    }
+
+    // 截图期间临时把 Esc 注册成全局快捷键：即使本程序不在前台，Esc 也一定能取消
+    var escRef: EventHotKeyRef?
+    func registerEsc() {
+        let id = EventHotKeyID(signature: OSType(0x51534854), id: 2)
+        RegisterEventHotKey(UInt32(kVK_Escape), 0, id, GetApplicationEventTarget(), 0, &escRef)
+    }
+
+    func unregisterEsc() {
+        if let escRef { UnregisterEventHotKey(escRef) }
+        escRef = nil
     }
 
     func unregisterHotKey() {
@@ -429,9 +463,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let o = SelectionOverlay { [weak self] target in
             guard let self else { return }
             self.overlay = nil
+            self.unregisterEsc()
             if let target { self.shoot(target) } else { self.capturing = false }
         }
         overlay = o
+        registerEsc()
         o.show()
     }
 

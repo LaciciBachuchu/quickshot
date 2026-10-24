@@ -16,6 +16,16 @@ func copyToClipboard(png: Data, image: NSImage, file: URL) {
     clipboardOwner = (file, pb.changeCount)
 }
 
+// 删除截图：文件移到废纸篓（可恢复），剪贴板里还是这张图的话一并清掉
+func trashScreenshot(_ file: URL) {
+    try? FileManager.default.trashItem(at: file, resultingItemURL: nil)
+    let pb = NSPasteboard.general
+    if let owner = clipboardOwner, owner.file == file, owner.changeCount == pb.changeCount {
+        pb.clearContents()
+        clipboardOwner = nil
+    }
+}
+
 enum Tool: Int { case pen, rect, ellipse, arrow }
 
 struct Annotation {
@@ -324,14 +334,8 @@ final class EditorController: NSObject, NSWindowDelegate {
     @objc func openInPreview() { NSWorkspace.shared.open(file) }
     @objc func doneClicked() { window.close() }
 
-    // 删除：文件移到废纸篓（可恢复），剪贴板里还是这张图的话一并清掉
     @objc func deleteClicked() {
-        try? FileManager.default.trashItem(at: file, resultingItemURL: nil)
-        let pb = NSPasteboard.general
-        if let owner = clipboardOwner, owner.file == file, owner.changeCount == pb.changeCount {
-            pb.clearContents()
-            clipboardOwner = nil
-        }
+        trashScreenshot(file)
         window.close()
     }
 
