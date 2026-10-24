@@ -6,7 +6,17 @@ import AppKit
 // 记下最后一次复制的是哪张截图，删除时只清掉自己放进剪贴板的内容
 var clipboardOwner: (file: URL, changeCount: Int)?
 
-func copyToClipboard(png: Data, image: NSImage, file: URL) {
+// 用 ImageIO 直接生成小尺寸缩略图，不需要先解码整张原图
+func makeThumbnail(_ file: URL, maxPixel: Int = 480) -> NSImage? {
+    let options: [CFString: Any] = [kCGImageSourceCreateThumbnailFromImageAlways: true,
+                                    kCGImageSourceThumbnailMaxPixelSize: maxPixel,
+                                    kCGImageSourceCreateThumbnailWithTransform: true]
+    guard let src = CGImageSourceCreateWithURL(file as CFURL, nil),
+          let cg = CGImageSourceCreateThumbnailAtIndex(src, 0, options as CFDictionary) else { return nil }
+    return NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
+}
+
+func copyToClipboard(png: Data, file: URL) {
     let item = NSPasteboardItem()
     item.setData(png, forType: .png)
     let pb = NSPasteboard.general
@@ -310,12 +320,12 @@ final class EditorController: NSObject, NSWindowDelegate {
 
     // 每次修改：合成新图 → 写回原文件 → 复制到剪贴板
     func sync() {
-        guard let png = canvas.renderPNG(), let img = NSImage(data: png) else {
+        guard let png = canvas.renderPNG() else {
             window.subtitle = "合成失败"
             return
         }
         try? png.write(to: file, options: .atomic)
-        copyToClipboard(png: png, image: img, file: file)
+        copyToClipboard(png: png, file: file)
         window.subtitle = "✓ 已同步到剪贴板"
     }
 

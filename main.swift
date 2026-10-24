@@ -507,25 +507,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             DispatchQueue.main.async {
                 self.capturing = false
                 guard let data = try? Data(contentsOf: file) else { return }  // 取消时没有文件
-                guard let image = NSImage(data: data) else { return }
-                copyToClipboard(png: data, image: image, file: file)
-                self.showThumbnail(file: file, image: image)
+                copyToClipboard(png: data, file: file)
+                // 缩略图在后台线程解码（整屏 PNG 解码约 20ms，放在主线程会卡掉一帧）
+                DispatchQueue.global(qos: .userInitiated).async {
+                    guard let thumb = makeThumbnail(file) else { return }
+                    DispatchQueue.main.async { self.showThumbnail(file: file, image: thumb) }
+                }
             }
         }
         do { try task.run() } catch { capturing = false }
     }
+
 
     func showThumbnail(file: URL, image: NSImage) {
         let t = ThumbnailPanel(file: file, image: image)
         t.onDismiss = { [weak self, weak t] in
             if self?.thumbnail === t { self?.thumbnail = nil }
         }
-        t.onClick = { [weak self] in self?.openEditor(file: file, image: image) }
+        t.onClick = { [weak self] in self?.openEditor(file: file) }
         thumbnail = t
         t.show()
     }
 
-    func openEditor(file: URL, image: NSImage) {
+    // 点开标注时才加载原图
+    func openEditor(file: URL) {
+        guard let image = NSImage(contentsOf: file) else { return }
         let e = EditorController(file: file, image: image)
         e.onClose = { [weak self, weak e] in self?.editors.removeAll { $0 === e } }
         editors.append(e)
