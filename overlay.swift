@@ -85,28 +85,6 @@ func setGlassContent(_ glass: NSView, _ content: NSView) {
     }
 }
 
-// 玻璃容器：把里面相邻的玻璃融合在一起并合并渲染（macOS 26+），旧系统就是普通视图
-func makeGlassContainer() -> NSView {
-    if #available(macOS 26.0, *) {
-        let c = NSGlassEffectContainerView()
-        c.spacing = OverlayView.ringWidth
-        let content = NSView()
-        content.wantsLayer = true
-        c.contentView = content
-        return c
-    }
-    return NSView()
-}
-
-func glassContainerContent(_ container: NSView) -> NSView {
-    if #available(macOS 26.0, *), let c = container as? NSGlassEffectContainerView, let content = c.contentView {
-        content.frame = c.bounds
-        content.autoresizingMask = [.width, .height]
-        return content
-    }
-    return container
-}
-
 // 简单的弹簧：数值朝目标“流”过去，略带回弹
 struct Spring {
     var value: [CGFloat]
@@ -140,9 +118,9 @@ extension CGRect {
     init(vec v: [CGFloat]) { self.init(x: v[0], y: v[1], width: max(v[2], 0), height: max(v[3], 0)) }
 }
 
-// 遮罩画面：变暗层 + 窗口玻璃轮廓 + 选区框 + 光标旁的玻璃提示
+// 遮罩画面：窗口玻璃轮廓 + 选区框 + 光标旁的玻璃提示（屏幕其他地方保持原样，不变暗）
 // 性能要点：全部用普通 CALayer 的 frame / border 实现（GPU 直接合成），不用 CAShapeLayer（改路径要在 CPU 上重新光栅化）；
-// 变暗层用四块矩形而不是超大圆角边框，玻璃只沿轮廓摆细条（Instruments 实测掉帧 54 → 7）；
+// 玻璃只沿轮廓摆四条，而不是整个窗口大小的玻璃再用遮罩裁掉；
 // 弹簧静止后暂停 display link，不空转
 final class OverlayView: NSView {
     weak var controller: SelectionOverlay?
@@ -151,19 +129,15 @@ final class OverlayView: NSView {
     var hovered: WindowInfo? { didSet { if hovered?.id != oldValue?.id { hoverChanged() } } }
 
     static let windowRadius: CGFloat = 12   // 窗口圆角
-    static let ringWidth: CGFloat = 7       // 玻璃轮廓粗细
-    static let dimColor = NSColor.black.withAlphaComponent(0.18).cgColor
+    // 玻璃轮廓粗细：太细（7pt）看不出折射和高光，只像一条灰线；玻璃开销按面积算，14pt 一圈仍远小于整窗玻璃
+    static let ringWidth: CGFloat = 14
 
-    let dimView = NSView()
-    let dimParts = (0..<4).map { _ in CALayer() }   // 洞四周的四块变暗矩形（最便宜的纯色图层）
-    let holeFill = CALayer()    // 盖在洞上，窗口轮廓淡出时把洞慢慢补暗，避免整屏闪一下
-    // 玻璃轮廓 = 四条细玻璃条，放在玻璃容器里：容器把相交的玻璃合并成一个整体并一次性渲染，
-    // GPU 只需要算轮廓那一圈的折射，而不是整个窗口大小的玻璃再用遮罩裁掉
-    let ringGlass = makeGlassContainer()
-    let ringStrips = (0..<4).map { _ in makeGlass(cornerRadius: OverlayView.ringWidth / 2) }
+    // 玻璃轮廓 = 一整块玻璃 + 环形遮罩：只有一块所以没有拼接缝（多块玻璃拼接处各自有边缘高光，一定会断）
+    static let ringRadius = windowRadius + ringWidth / 2   // 外圈圆角；内圈 = 外圈 - 粗细，正好贴合窗口圆角
+    let ringGlass = NSView()                                // 只用来整体控制透明度
+    let ringPiece = makeGlass(cornerRadius: OverlayView.ringRadius)
+    let ringMask = CALayer()
     let lineView = NSView()
-    let ringLine = CALayer()
-    let ringShade = CALayer()
     let selBorder = CALayer()
     let sizeLabel = CATextLayer()
     let hint = makeGlass(cornerRadius: 17)
@@ -182,31 +156,23 @@ final class OverlayView: NSView {
         super.init(frame: frame)
         wantsLayer = true
 
-        for v in [dimView, ringGlass, lineView] {
+        for v in [ringGlass, lineView] {
             v.frame = bounds
             v.wantsLayer = true
             addSubview(v)
         }
-        dimView.autoresizingMask = [.width, .height]
         lineView.autoresizingMask = [.width, .height]
 
-        for l in dimParts + [holeFill] {
-            l.backgroundColor = OverlayView.dimColor
-            dimView.layer!.addSublayer(l)
-        }
-
-        let stripHost = glassContainerContent(ringGlass)
-        for g in ringStrips {
-            g.wantsLayer = true
-            stripHost.addSubview(g)
-        }
+        ringPiece.wantsLayer = true
+        ringGlass.addSubview(ringPiece)
+        ringMask.borderColor = NSColor.black.cgColor
+        ringMask.borderWidth = OverlayView.ringWidth
+        ringMask.cornerRadius = OverlayView.ringRadius
+        ringMask.anchorPoint = .zero
+        ringMask.position = .zero
+        ringPiece.layer!.mask = ringMask
         ringGlass.layer!.opacity = 0
 
-        // 轮廓内侧一条细亮线 + 再往里一圈淡黑线，白色窗口上也看得清
-        ringLine.borderColor = NSColor.white.withAlphaComponent(0.95).cgColor
-        ringLine.borderWidth = 1.5
-        ringShade.borderColor = NSColor.black.withAlphaComponent(0.25).cgColor
-        ringShade.borderWidth = 1
         selBorder.borderColor = NSColor.white.cgColor
         selBorder.borderWidth = 1
         selBorder.isHidden = true
@@ -217,7 +183,7 @@ final class OverlayView: NSView {
         sizeLabel.font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .medium)
         sizeLabel.fontSize = 11
         sizeLabel.isHidden = true
-        for l in [ringShade, ringLine, selBorder, sizeLabel] { lineView.layer!.addSublayer(l) }
+        for l in [selBorder, sizeLabel] { lineView.layer!.addSublayer(l) }
 
         buildHint()
         hint.wantsLayer = true
@@ -291,7 +257,7 @@ final class OverlayView: NSView {
             ringShown = true
             ringAlpha.target = [1]
         } else {
-            // 离开窗口（比如移到 Dock）：轮廓留在原地淡出，洞同步慢慢变暗
+            // 离开窗口（比如移到 Dock）：轮廓留在原地淡出
             ringShown = false
             ringAlpha.target = [0]
         }
@@ -307,7 +273,46 @@ final class OverlayView: NSView {
         let idle = ring.settled && ringAlpha.settled && hintPos.settled && hintAlpha.settled
         if idle { ring.snap(); ringAlpha.snap(); hintPos.snap(); hintAlpha.snap() }
         updateLayers()
-        if idle { l.isPaused = true }
+        if idle {
+            settleGlass()
+            l.isPaused = true
+        }
+    }
+
+    // 把玻璃放到目标位置 d：
+    // 移动中不改视图 frame（会触发 AppKit 布局，每次 4~8ms），而是给玻璃图层加“拉伸 + 平移”变换，
+    // 同时给遮罩加反向缩放，抵消拉伸，所以露出来的那一圈粗细、圆角始终准确
+    func placeRing(_ d: CGRect) {
+        guard let layer = ringPiece.layer else { return }
+        let f = ringPiece.frame
+        if f.width < 1 || f.height < 1 || d.width < 1 || d.height < 1 {
+            settleRing(d)
+            return
+        }
+        let sx = d.width / f.width, sy = d.height / f.height
+        let a = layer.anchorPoint
+        layer.setAffineTransform(CGAffineTransform(a: sx, b: 0, c: 0, d: sy,
+                                                   tx: d.minX + sx * a.x * f.width - (f.minX + a.x * f.width),
+                                                   ty: d.minY + sy * a.y * f.height - (f.minY + a.y * f.height)))
+        ringMask.bounds = CGRect(origin: .zero, size: d.size)
+        ringMask.setAffineTransform(CGAffineTransform(scaleX: 1 / sx, y: 1 / sy))
+    }
+
+    // 停稳后真正设置一次视图 frame（玻璃按真实尺寸重新渲染），去掉临时变换
+    func settleRing(_ d: CGRect) {
+        ringPiece.frame = d
+        ringPiece.layer!.setAffineTransform(.identity)
+        ringMask.bounds = CGRect(origin: .zero, size: d.size)
+        ringMask.setAffineTransform(.identity)
+    }
+
+    func settleGlass() {
+        guard !lastRingFrame.isNull,
+              ringPiece.frame != lastRingFrame || !CATransform3DIsIdentity(ringPiece.layer!.transform) else { return }
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        settleRing(lastRingFrame)
+        CATransaction.commit()
     }
 
     func updateLayers() {
@@ -316,12 +321,9 @@ final class OverlayView: NSView {
 
         let alpha = max(0, min(1, ringAlpha.value[0]))
         let r = CGRect(vec: ring.value)
-        let rw = OverlayView.ringWidth, rad = OverlayView.windowRadius
+        let rw = OverlayView.ringWidth
 
-        // 变暗层的洞：框选时是选区（直角），否则是窗口轮廓（圆角，随轮廓淡出被补暗）
-        let hole: CGRect, holeCover: Float
         if let sel = selection {
-            hole = sel; holeCover = 0
             selBorder.frame = sel.insetBy(dx: -1, dy: -1)
             selBorder.isHidden = false
             let text = "\(Int(sel.width)) × \(Int(sel.height))"
@@ -335,38 +337,17 @@ final class OverlayView: NSView {
             sizeLabel.frame.origin = CGPoint(x: sel.minX, y: y)
             sizeLabel.isHidden = false
         } else {
-            hole = r; holeCover = Float(1 - alpha)
             selBorder.isHidden = true
             sizeLabel.isHidden = true
         }
-        // 洞四周四块：上、下、左、右（洞的四角是直角，窗口圆角外那一点点被玻璃轮廓盖住）
-        let h = hole.intersection(bounds).isNull ? CGRect(x: bounds.midX, y: bounds.midY, width: 0, height: 0) : hole
-        dimParts[0].frame = CGRect(x: 0, y: h.maxY, width: bounds.width, height: max(0, bounds.height - h.maxY))
-        dimParts[1].frame = CGRect(x: 0, y: 0, width: bounds.width, height: max(0, h.minY))
-        dimParts[2].frame = CGRect(x: 0, y: h.minY, width: max(0, h.minX), height: h.height)
-        dimParts[3].frame = CGRect(x: h.maxX, y: h.minY, width: max(0, bounds.width - h.maxX), height: h.height)
-        holeFill.frame = h
-        holeFill.opacity = holeCover
 
-        // 玻璃轮廓：四条玻璃条沿窗口边缘摆放，四角相互重叠，由玻璃容器融合成一圈
-        // 直接改图层 frame，不走 NSView.frame（那会触发 AppKit 布局，实测每帧 4~8ms，改图层只要 0.03ms）
+        // 玻璃轮廓：外框比窗口大半圈（骑在窗口边缘上），移动中用变换，停稳后 settleGlass 设真实 frame
         let outer = r.insetBy(dx: -rw / 2, dy: -rw / 2)
         if outer != lastRingFrame {
             lastRingFrame = outer
-            ringStrips[0].layer!.frame = CGRect(x: outer.minX, y: outer.maxY - rw, width: outer.width, height: rw)
-            ringStrips[1].layer!.frame = CGRect(x: outer.minX, y: outer.minY, width: outer.width, height: rw)
-            ringStrips[2].layer!.frame = CGRect(x: outer.minX, y: outer.minY, width: rw, height: outer.height)
-            ringStrips[3].layer!.frame = CGRect(x: outer.maxX - rw, y: outer.minY, width: rw, height: outer.height)
-            let inner = r.insetBy(dx: rw / 2, dy: rw / 2)
-            ringLine.frame = inner
-            ringLine.cornerRadius = rad - rw / 2
-            ringShade.frame = inner.insetBy(dx: 1.5, dy: 1.5)
-            ringShade.cornerRadius = rad - rw / 2 - 1.5
+            placeRing(outer)
         }
-        let ringVisible = Float(selection == nil ? alpha : 0)
-        ringGlass.layer!.opacity = ringVisible
-        ringLine.opacity = ringVisible
-        ringShade.opacity = ringVisible
+        ringGlass.layer!.opacity = Float(selection == nil ? alpha : 0)
 
         // 提示的视图固定在原点，用图层平移来移动（同样避开 AppKit 布局，实测 6.9ms → 0.03ms）
         let origin = CGPoint(x: hintPos.value[0].rounded(), y: hintPos.value[1].rounded())
@@ -481,7 +462,8 @@ final class SelectionOverlay {
                                  backing: .buffered, defer: false)
             w.level = NSWindow.Level(rawValue: Int(CGShieldingWindowLevel()))
             w.isOpaque = false
-            w.backgroundColor = .clear
+            // 几乎全透明但不是 0：完全透明的地方鼠标点击会穿透到下面的窗口
+            w.backgroundColor = NSColor(white: 0, alpha: 0.004)
             w.hasShadow = false
             w.ignoresMouseEvents = false
             w.acceptsMouseMovedEvents = true
