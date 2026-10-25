@@ -5,7 +5,7 @@ import AppKit
 
 enum CaptureTarget {
     case region(CGRect)       // 全局坐标，左上角为原点（screencapture -R 用的坐标）
-    case window(CGWindowID)
+    case window(CGWindowID, CGRect)   // 窗口编号 + 外框（全局坐标，左上原点），从冻结画面里按外框裁剪
 }
 
 struct WindowInfo {
@@ -52,9 +52,11 @@ func allowCursorInBackground() {
     _ = unsafeBitCast(s, to: SetProp.self)(cid, cid, "SetsCursorInBackground" as CFString, kCFBooleanTrue)
 }
 
-// 不激活本程序也能成为 key window、接收键盘
+// 遮罩面板：既不激活本程序，也永远不成为 key 窗口——
+// 否则别的 App 正展开的菜单、下拉框会因为失去焦点而关掉。键盘（Esc）走全局热键，不需要 key 窗口
 final class OverlayPanel: NSPanel {
-    override var canBecomeKey: Bool { true }
+    override var canBecomeKey: Bool { false }
+    override var canBecomeMain: Bool { false }
 }
 
 // 液态玻璃视图（macOS 26+ 原生 NSGlassEffectView，旧系统退回毛玻璃）
@@ -162,10 +164,24 @@ final class OverlayView: NSView {
     var lastRingFrame = CGRect.null
     var lastHintOrigin = CGPoint(x: -1, y: -1)
 
+    // 冻结画面：按快捷键那一刻拍下的整屏图，铺在遮罩最底层
+    let frozenView = NSView()
+
+    func showFrozen(_ image: CGImage?) {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        frozenView.layer?.contents = image
+        CATransaction.commit()
+    }
+
     override init(frame: NSRect) {
         super.init(frame: frame)
         wantsLayer = true
 
+        frozenView.frame = bounds
+        frozenView.wantsLayer = true
+        frozenView.layer?.contentsGravity = .resize
+        addSubview(frozenView)
         for v in [ringGlass, lineView] {
             v.frame = bounds
             v.wantsLayer = true
@@ -248,6 +264,7 @@ final class OverlayView: NSView {
         ringAlpha.value = [0]; ringAlpha.target = [0]
         hintAlpha.value = [0]; hintAlpha.target = [0]
         lastHintOrigin = CGPoint(x: -1, y: -1)
+        showFrozen(nil)   // 上一次的冻结画面不留在内存里
         updateLayers()
         pause()
     }
@@ -571,11 +588,8 @@ final class SelectionOverlay {
     func show() {
         allowCursorInBackground()
         for w in windows { w.orderFrontRegardless() }
-        // 鼠标所在屏幕的遮罩接收键盘（Esc）；面板不需要激活本程序也能拿到键盘
+        // 不让任何遮罩成为 key 窗口（见 OverlayPanel），Esc 由全局热键处理
         let mouse = NSEvent.mouseLocation
-        let key = windows.first { NSMouseInRect(mouse, $0.frame, false) } ?? windows.first
-        key?.makeKeyAndOrderFront(nil)
-        key?.makeFirstResponder(key?.contentView)
         NSCursor.crosshair.set()
         for v in views {
             if let w = v.window, NSMouseInRect(mouse, w.frame, false) {
@@ -583,6 +597,14 @@ final class SelectionOverlay {
             }
         }
         hover(at: mouse)
+    }
+
+    func showFrozen(_ shots: [FrozenScreen]) {
+        guard !finished else { return }
+        for v in views {
+            guard let id = v.window?.screen?.displayID else { continue }
+            v.showFrozen(shots.first { $0.displayID == id }?.image)
+        }
     }
 
     func window(at point: NSPoint) -> WindowInfo? {
@@ -601,7 +623,7 @@ final class SelectionOverlay {
 
     func pickWindow(at point: NSPoint) {
         guard let w = window(at: point) else { NSSound.beep(); return }   // 桌面空白处没有窗口
-        finish(.window(w.id))
+        finish(.window(w.id, w.frame))
     }
 
     func finish(_ target: CaptureTarget?) {

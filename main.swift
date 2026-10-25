@@ -396,6 +396,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             registerHotKey()
         }
         _ = readyOverlay()   // 启动时就建好遮罩并预热，第一次截图也不卡
+        // 拍屏用的过滤器提前建好，并空拍一次预热：启动后第一次拍屏要 ~400ms，之后约 70ms
+        Task {
+            await ScreenFreezer.prepare()
+            _ = await ScreenFreezer.captureAll()
+        }
+        NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main) { _ in
+            ScreenFreezer.invalidate()
+            Task { await ScreenFreezer.prepare() }
+        }
     }
 
     // 全局快捷键（用 Carbon 注册，不需要辅助功能权限）
@@ -476,47 +485,92 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return o
     }
 
+    // 按快捷键那一刻开始的整屏预拍（遮罩同时出现，不等它拍完）
+    var freezeTask: Task<[FrozenScreen], Never>?
+    var lastFreezeLatency: Double = 0   // 从按下到冻结画面就绪的耗时（毫秒）
+
     @objc func capture() {
         guard !capturing else { return }  // 防止重复触发
         capturing = true
         thumbnail?.dismiss()
+        let t0 = CACurrentMediaTime()
+        let task = Task { await ScreenFreezer.captureAll() }
+        freezeTask = task
         // 左键拖选区域 / 右键选窗口，Esc 取消
         registerEsc()
-        readyOverlay().begin { [weak self] target in
+        let overlay = readyOverlay()
+        overlay.begin { [weak self] target in
             guard let self else { return }
             self.unregisterEsc()
-            if let target { self.shoot(target) } else { self.capturing = false }
+            if let target { self.shoot(target) } else { self.capturing = false; self.freezeTask = nil }
+        }
+        Task { @MainActor in
+            let shots = await task.value
+            self.lastFreezeLatency = (CACurrentMediaTime() - t0) * 1000
+            overlay.showFrozen(shots)
         }
     }
 
-    func shoot(_ target: CaptureTarget) {
+    func newScreenshotURL() -> URL {
         try? FileManager.default.createDirectory(at: saveDir, withIntermediateDirectories: true)
         let fmt = DateFormatter()
         fmt.dateFormat = "yyyy-MM-dd HH.mm.ss"
-        let file = saveDir.appendingPathComponent("截图 \(fmt.string(from: Date())).png")
+        return saveDir.appendingPathComponent("截图 \(fmt.string(from: Date())).png")
+    }
+
+    // 优先从冻结画面裁剪（能截到当时展开的菜单）；拍屏失败才退回实时截图
+    func shoot(_ target: CaptureTarget) {
+        let file = newScreenshotURL()
+        let rect: CGRect
+        switch target {
+        case .region(let r): rect = r
+        case .window(_, let frame): rect = frame
+        }
+        let task = freezeTask
+        freezeTask = nil
+        Task { @MainActor in
+            if let shots = await task?.value, let shot = ScreenFreezer.crop(shots, rect: rect), ScreenFreezer.writePNG(shot, to: file) {
+                NSSound(contentsOfFile: "/System/Library/Components/CoreAudio.component/Contents/SharedSupport/SystemSounds/system/Grab.aif",
+                        byReference: true)?.play()
+                self.capturing = false
+                self.didCapture(file)
+            } else {
+                self.shootLive(target, to: file)
+            }
+        }
+    }
+
+    // 截图文件就绪：复制到剪贴板，右下角弹缩略图
+    func didCapture(_ file: URL) {
+        guard let data = try? Data(contentsOf: file) else { return }
+        copyToClipboard(png: data, file: file)
+        // 缩略图在后台线程解码（整屏 PNG 解码约 20ms，放在主线程会卡掉一帧）
+        DispatchQueue.global(qos: .userInitiated).async {
+            guard let thumb = makeThumbnail(file) else { return }
+            DispatchQueue.main.async { self.showThumbnail(file: file, image: thumb) }
+        }
+    }
+
+    // 退回方案：用系统 screencapture 实时截取
+    func shootLive(_ target: CaptureTarget, to file: URL) {
 
         let task = Process()
         task.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
         switch target {
         case .region(let r):
             task.arguments = ["-R\(Int(r.minX.rounded())),\(Int(r.minY.rounded())),\(Int(r.width.rounded())),\(Int(r.height.rounded()))", file.path]
-        case .window(let id):
+        case .window(let id, _):
             task.arguments = ["-o", "-l\(id)", file.path]   // -o: 不带窗口阴影
         }
         task.terminationHandler = { _ in
             DispatchQueue.main.async {
                 self.capturing = false
-                guard let data = try? Data(contentsOf: file) else { return }  // 取消时没有文件
-                copyToClipboard(png: data, file: file)
-                // 缩略图在后台线程解码（整屏 PNG 解码约 20ms，放在主线程会卡掉一帧）
-                DispatchQueue.global(qos: .userInitiated).async {
-                    guard let thumb = makeThumbnail(file) else { return }
-                    DispatchQueue.main.async { self.showThumbnail(file: file, image: thumb) }
-                }
+                self.didCapture(file)
             }
         }
         do { try task.run() } catch { capturing = false }
     }
+
 
 
     func showThumbnail(file: URL, image: NSImage) {
