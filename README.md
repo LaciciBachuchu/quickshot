@@ -28,8 +28,14 @@ Requires the Xcode command line tools (`xcode-select --install`). Liquid Glass e
 需要 Xcode 命令行工具。液态玻璃效果需要 macOS 26 及以上，旧系统会退回毛玻璃。
 
 ```bash
+./setup-signing.sh   # once: creates a local code-signing certificate in your login keychain
+                     # 只需一次：在登录钥匙串里生成本机签名证书
 ./build.sh
 ```
+
+`setup-signing.sh` keeps the app's code signature identical across rebuilds, so the Screen Recording permission survives every rebuild. Without it the build is ad-hoc signed, and macOS asks for the permission again after each rebuild.
+
+`setup-signing.sh` 让每次编译出来的签名身份保持不变，屏幕录制权限授权一次就一直有效；不运行的话会用临时签名，每次重新编译都要重新授权。
 
 This builds and installs `~/Applications/QuickShot.app` and launches it. On the first capture, allow QuickShot under **System Settings → Privacy & Security → Screen & System Audio Recording**.
 
