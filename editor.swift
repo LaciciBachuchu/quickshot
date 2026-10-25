@@ -89,6 +89,24 @@ final class CanvasView: NSView {
     var color: NSColor = .systemRed
     var lineWidth: CGFloat = 4   // 屏幕上看到的粗细
     var onChange: () -> Void = {}
+    var onHistoryChange: () -> Void = {}
+
+    // 撤销 / 重做：每次修改前把整组标注存一份快照，撤销、重做就是在快照之间切换
+    // （比“删掉最后一笔”通用：之后移动、改文字这类修改也能撤销）
+    var undoStack: [[Annotation]] = []
+    var redoStack: [[Annotation]] = []
+    var canUndo: Bool { !undoStack.isEmpty }
+    var canRedo: Bool { !redoStack.isEmpty }
+
+    func commit(_ change: () -> Void) {
+        undoStack.append(annotations)
+        if undoStack.count > 100 { undoStack.removeFirst() }
+        redoStack.removeAll()
+        change()
+        needsDisplay = true
+        onChange()
+        onHistoryChange()
+    }
 
     init(image: NSImage) {
         self.image = image
@@ -148,17 +166,27 @@ final class CanvasView: NSView {
         current = nil
         let a = c.points.first!, b = c.points.last!
         if c.tool == .pen || hypot(b.x - a.x, b.y - a.y) > 2 {  // 形状工具误点一下不算
-            annotations.append(c)
-            onChange()
+            commit { annotations.append(c) }
         }
         needsDisplay = true
     }
 
     func undo() {
-        guard !annotations.isEmpty else { return }
-        annotations.removeLast()
+        guard let last = undoStack.popLast() else { return }
+        redoStack.append(annotations)
+        annotations = last
         needsDisplay = true
         onChange()
+        onHistoryChange()
+    }
+
+    func redo() {
+        guard let next = redoStack.popLast() else { return }
+        undoStack.append(annotations)
+        annotations = next
+        needsDisplay = true
+        onChange()
+        onHistoryChange()
     }
 
     // 按原图像素尺寸合成，保证清晰度不变
@@ -180,7 +208,19 @@ final class CanvasView: NSView {
 }
 
 final class EditorWindow: NSWindow {
+    var onRedo: () -> Void = {}
+
     override func cancelOperation(_ sender: Any?) { close() }  // Esc 关闭
+
+    // ⌘⇧Z 重做：按键码判断（按钮的快捷键写法匹配不上 Shift 产生的大写 Z）
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        let mods = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        if mods == [.command, .shift] && event.keyCode == 6 {
+            onRedo()
+            return true
+        }
+        return super.performKeyEquivalent(with: event)
+    }
 }
 
 final class EditorController: NSObject, NSWindowDelegate {
@@ -191,6 +231,8 @@ final class EditorController: NSObject, NSWindowDelegate {
     let colors: [NSColor] = [.systemRed, .systemYellow, .systemGreen, .systemBlue, .black, .white]
     var colorButtons: [NSButton] = []
     let widths: [CGFloat] = [2, 4, 8]
+    let undoButton = NSButton()
+    let redoButton = NSButton()
 
     init(file: URL, image: NSImage) {
         self.file = file
@@ -205,6 +247,8 @@ final class EditorController: NSObject, NSWindowDelegate {
         window.delegate = self
 
         canvas.onChange = { [weak self] in self?.sync() }
+        canvas.onHistoryChange = { [weak self] in self?.updateHistoryButtons() }
+        window.onRedo = { [weak self] in self?.canvas.redo() }
         buildUI(barHeight: barHeight)
         window.subtitle = "画完自动复制到剪贴板"
         fitToImage()
@@ -266,12 +310,21 @@ final class EditorController: NSObject, NSWindowDelegate {
                                        target: self, action: #selector(widthChanged(_:)))
         width.selectedSegment = 1
 
-        let undo = NSButton(image: NSImage(systemSymbolName: "arrow.uturn.backward", accessibilityDescription: "撤销")!,
-                            target: self, action: #selector(undoClicked))
-        undo.bezelStyle = .rounded
-        undo.keyEquivalent = "z"
-        undo.keyEquivalentModifierMask = .command
-        undo.toolTip = "撤销 ⌘Z"
+        undoButton.image = NSImage(systemSymbolName: "arrow.uturn.backward", accessibilityDescription: "撤销")
+        undoButton.target = self
+        undoButton.action = #selector(undoClicked)
+        undoButton.bezelStyle = .rounded
+        undoButton.keyEquivalent = "z"
+        undoButton.keyEquivalentModifierMask = .command
+        undoButton.toolTip = "撤销 ⌘Z"
+        redoButton.image = NSImage(systemSymbolName: "arrow.uturn.forward", accessibilityDescription: "重做")
+        redoButton.target = self
+        redoButton.action = #selector(redoClicked)
+        redoButton.bezelStyle = .rounded
+        redoButton.toolTip = "重做 ⌘⇧Z"
+        let history = NSStackView(views: [undoButton, redoButton])
+        history.spacing = 4
+        updateHistoryButtons()
 
         let preview = NSButton(image: NSImage(systemSymbolName: "arrow.up.forward.app", accessibilityDescription: "用预览打开")!,
                                target: self, action: #selector(openInPreview))
@@ -291,7 +344,7 @@ final class EditorController: NSObject, NSWindowDelegate {
         trash.keyEquivalentModifierMask = .command
         trash.toolTip = "删除这张截图 ⌘⌫（移到废纸篓）"
 
-        let bar = NSStackView(views: [tools, colorRow, width, undo, spacer, trash, preview, done])
+        let bar = NSStackView(views: [tools, colorRow, width, history, spacer, trash, preview, done])
         bar.spacing = 12
         bar.edgeInsets = NSEdgeInsets(top: 0, left: 12, bottom: 0, right: 12)
 
@@ -340,6 +393,12 @@ final class EditorController: NSObject, NSWindowDelegate {
     @objc func colorChanged(_ sender: NSButton) { canvas.color = colors[sender.tag]; highlightColor(sender.tag) }
     @objc func widthChanged(_ sender: NSSegmentedControl) { canvas.lineWidth = widths[sender.selectedSegment] }
     @objc func undoClicked() { canvas.undo() }
+    @objc func redoClicked() { canvas.redo() }
+
+    func updateHistoryButtons() {
+        undoButton.isEnabled = canvas.canUndo
+        redoButton.isEnabled = canvas.canRedo
+    }
     @objc func openInPreview() { NSWorkspace.shared.open(file) }
     @objc func doneClicked() { window.close() }
 
