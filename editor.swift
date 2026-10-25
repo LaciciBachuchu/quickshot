@@ -1,6 +1,6 @@
 import AppKit
 
-// 截图标注窗口：画笔 / 矩形 / 椭圆 / 箭头，每画一笔都会同步到剪贴板并保存回原文件
+// 截图标注窗口：画笔 / 矩形 / 椭圆 / 箭头 / 马赛克，每画一笔都会同步到剪贴板并保存回原文件
 
 // 剪贴板只放 PNG（不放 TIFF：未压缩，整屏截图要几十 MB）
 // 记下最后一次复制的是哪张截图，删除时只清掉自己放进剪贴板的内容
@@ -35,7 +35,7 @@ func trashScreenshot(_ file: URL) {
     }
 }
 
-enum Tool: Int { case pen, rect, ellipse, arrow }
+enum Tool: Int { case pen, rect, ellipse, arrow, mosaic }
 
 struct Annotation {
     var tool: Tool
@@ -43,8 +43,13 @@ struct Annotation {
     var width: CGFloat      // 图片坐标下的线宽
     var points: [CGPoint]   // 图片坐标；画笔为全部点，其余为起点和终点
 
-    func draw() {
+    // mosaic：给定色块大小，返回整张原图的像素化版本（由画布缓存提供）
+    func draw(mosaic: (CGFloat) -> CGImage? = { _ in nil }) {
         guard let first = points.first, let last = points.last else { return }
+        if tool == .mosaic {
+            drawMosaic(mosaic)
+            return
+        }
         color.set()
         let path = NSBezierPath()
         path.lineWidth = width
@@ -77,7 +82,37 @@ struct Annotation {
             tip.line(to: CGPoint(x: last.x - cos(angle + 0.45) * head, y: last.y - sin(angle + 0.45) * head))
             tip.close()
             tip.fill()
+        case .mosaic:
+            break
         }
+    }
+
+    // 马赛克色块大小（图片坐标）：跟随笔刷粗细
+    var mosaicBlock: CGFloat { max(5, (width * 0.4).rounded()) }
+
+    // 沿涂抹轨迹（圆头粗线）裁剪，在裁剪区内画整张图的像素化版本
+    func drawMosaic(_ mosaic: (CGFloat) -> CGImage?) {
+        guard let cg = NSGraphicsContext.current?.cgContext, let pixelated = mosaic(mosaicBlock),
+              let first = points.first else { return }
+        let path = CGMutablePath()
+        path.move(to: first)
+        if points.count == 1 { path.addLine(to: CGPoint(x: first.x + 0.01, y: first.y)) }   // 单击也打出一个圆点
+        for p in points.dropFirst() { path.addLine(to: p) }
+        cg.saveGState()
+        cg.addPath(path)
+        cg.setLineWidth(width)
+        cg.setLineCap(.round)
+        cg.setLineJoin(.round)
+        cg.replacePathWithStrokedPath()
+        cg.clip()
+        cg.interpolationQuality = .none   // 放大时保持色块的硬边
+        cg.draw(pixelated, in: CGRect(origin: .zero, size: mosaicCanvasSize(pixelated)))
+        cg.restoreGState()
+    }
+
+    // 像素化小图每个像素对应一个色块；按色块整数倍铺开，保证色块大小一致、和图片左下角对齐
+    func mosaicCanvasSize(_ pixelated: CGImage) -> CGSize {
+        CGSize(width: CGFloat(pixelated.width) * mosaicBlock, height: CGFloat(pixelated.height) * mosaicBlock)
     }
 }
 
@@ -88,6 +123,25 @@ final class CanvasView: NSView {
     var tool: Tool = .pen
     var color: NSColor = .systemRed
     var lineWidth: CGFloat = 4   // 屏幕上看到的粗细
+    var mosaicWidth: CGFloat = 26   // 马赛克笔刷直径（屏幕上），跟随粗细档位
+
+    // 按色块大小缓存整张原图的像素化版本：缩小（平均颜色）后的小图，绘制时最近邻放大成色块
+    var mosaicCache: [CGFloat: CGImage] = [:]
+
+    func pixelated(block: CGFloat) -> CGImage? {
+        if let c = mosaicCache[block] { return c }
+        guard let src = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return nil }
+        let w = max(1, Int(ceil(image.size.width / block))), h = max(1, Int(ceil(image.size.height / block)))
+        guard let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0,
+                                  space: src.colorSpace ?? CGColorSpaceCreateDeviceRGB(),
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+        ctx.interpolationQuality = .medium   // 缩小时取平均色，色块颜色更自然
+        // 原图按色块整数倍铺开（右/上边可能超出一点），和绘制时的铺法一致
+        ctx.draw(src, in: CGRect(x: 0, y: 0, width: image.size.width / block, height: image.size.height / block))
+        let out = ctx.makeImage()
+        mosaicCache[block] = out
+        return out
+    }
     var onChange: () -> Void = {}
     var onHistoryChange: () -> Void = {}
 
@@ -140,8 +194,8 @@ final class CanvasView: NSView {
         t.translateX(by: r.minX, yBy: r.minY)
         t.scale(by: scale)
         t.concat()
-        annotations.forEach { $0.draw() }
-        current?.draw()
+        annotations.forEach { $0.draw(mosaic: pixelated) }
+        current?.draw(mosaic: pixelated)
         NSGraphicsContext.restoreGraphicsState()
     }
 
@@ -150,13 +204,14 @@ final class CanvasView: NSView {
     override func resetCursorRects() { addCursorRect(imageRect, cursor: .crosshair) }
 
     override func mouseDown(with event: NSEvent) {
-        current = Annotation(tool: tool, color: color, width: lineWidth / scale, points: [toImage(event)])
+        let w = tool == .mosaic ? mosaicWidth : lineWidth
+        current = Annotation(tool: tool, color: color, width: w / scale, points: [toImage(event)])
     }
 
     override func mouseDragged(with event: NSEvent) {
         guard var c = current else { return }
         let p = toImage(event)
-        if c.tool == .pen { c.points.append(p) } else { c.points = [c.points[0], p] }
+        if c.tool == .pen || c.tool == .mosaic { c.points.append(p) } else { c.points = [c.points[0], p] }
         current = c
         needsDisplay = true
     }
@@ -165,7 +220,7 @@ final class CanvasView: NSView {
         guard let c = current else { return }
         current = nil
         let a = c.points.first!, b = c.points.last!
-        if c.tool == .pen || hypot(b.x - a.x, b.y - a.y) > 2 {  // 形状工具误点一下不算
+        if c.tool == .pen || c.tool == .mosaic || hypot(b.x - a.x, b.y - a.y) > 2 {  // 形状工具误点一下不算
             commit { annotations.append(c) }
         }
         needsDisplay = true
@@ -201,7 +256,7 @@ final class CanvasView: NSView {
         NSGraphicsContext.saveGraphicsState()
         NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
         image.draw(in: NSRect(origin: .zero, size: image.size))
-        annotations.forEach { $0.draw() }
+        annotations.forEach { $0.draw(mosaic: pixelated) }
         NSGraphicsContext.restoreGraphicsState()
         return rep.representation(using: .png, properties: [:])
     }
@@ -231,6 +286,7 @@ final class EditorController: NSObject, NSWindowDelegate {
     let colors: [NSColor] = [.systemRed, .systemYellow, .systemGreen, .systemBlue, .black, .white]
     var colorButtons: [NSButton] = []
     let widths: [CGFloat] = [2, 4, 8]
+    let mosaicWidths: [CGFloat] = [14, 26, 44]   // 马赛克笔刷直径，对应细 / 中 / 粗
     let undoButton = NSButton()
     let redoButton = NSButton()
 
@@ -282,10 +338,10 @@ final class EditorController: NSObject, NSWindowDelegate {
     }
 
     func buildUI(barHeight: CGFloat) {
-        let tools = NSSegmentedControl(images: ["pencil.tip", "rectangle", "circle", "arrow.up.right"].map {
+        let tools = NSSegmentedControl(images: ["pencil.tip", "rectangle", "circle", "arrow.up.right", "checkerboard.rectangle"].map {
             NSImage(systemSymbolName: $0, accessibilityDescription: nil)!
         }, trackingMode: .selectOne, target: self, action: #selector(toolChanged(_:)))
-        for (i, tip) in ["画笔", "矩形", "椭圆", "箭头"].enumerated() { tools.setToolTip(tip, forSegment: i) }
+        for (i, tip) in ["画笔", "矩形", "椭圆", "箭头", "马赛克"].enumerated() { tools.setToolTip(tip, forSegment: i) }
         tools.selectedSegment = 0
 
         let colorRow = NSStackView()
@@ -391,7 +447,10 @@ final class EditorController: NSObject, NSWindowDelegate {
 
     @objc func toolChanged(_ sender: NSSegmentedControl) { canvas.tool = Tool(rawValue: sender.selectedSegment) ?? .pen }
     @objc func colorChanged(_ sender: NSButton) { canvas.color = colors[sender.tag]; highlightColor(sender.tag) }
-    @objc func widthChanged(_ sender: NSSegmentedControl) { canvas.lineWidth = widths[sender.selectedSegment] }
+    @objc func widthChanged(_ sender: NSSegmentedControl) {
+        canvas.lineWidth = widths[sender.selectedSegment]
+        canvas.mosaicWidth = mosaicWidths[sender.selectedSegment]
+    }
     @objc func undoClicked() { canvas.undo() }
     @objc func redoClicked() { canvas.redo() }
 

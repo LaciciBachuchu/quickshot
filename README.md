@@ -16,8 +16,10 @@ A tiny macOS menu bar screenshot tool. Press the hotkey (or click the icon), **d
   保存到 `~/Pictures/Screenshots/` 并复制到剪贴板（PNG）
 - Floating thumbnail in the bottom-right: drag it into any app, right-click to delete, click to annotate
   右下角缩略图：可直接拖进其他 App，右键删除，单击打开标注
-- Annotation window: pen / rectangle / ellipse / arrow, 6 colors, 3 widths, `⌘Z` undo / `⌘⇧Z` redo (also toolbar buttons) — every stroke is synced to the clipboard and the file immediately; `⌘⌫` moves the screenshot to the Trash
-  标注窗口：画笔 / 矩形 / 椭圆 / 箭头，6 种颜色、3 种粗细，⌘Z 撤销 / ⌘⇧Z 重做（工具栏也有按钮），每一笔实时同步到剪贴板和文件；⌘⌫ 删除（移到废纸篓）
+- Annotation window: pen / rectangle / ellipse / arrow / mosaic, 6 colors, 3 widths, `⌘Z` undo / `⌘⇧Z` redo (also toolbar buttons) — every stroke is synced to the clipboard and the file immediately; `⌘⌫` moves the screenshot to the Trash
+  标注窗口：画笔 / 矩形 / 椭圆 / 箭头 / 马赛克，6 种颜色、3 种粗细，⌘Z 撤销 / ⌘⇧Z 重做（工具栏也有按钮），每一笔实时同步到剪贴板和文件；⌘⌫ 删除（移到废纸篓）
+- Mosaic: drag to smear a pixelated brush over sensitive content; brush size follows the thin / medium / thick setting
+  马赛克：按住拖动涂抹打码，笔刷大小跟随细 / 中 / 粗三档
 - Launch at login (toggle in the menu)
   开机自动启动（菜单里勾选）
 
