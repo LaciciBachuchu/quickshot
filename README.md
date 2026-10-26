@@ -6,8 +6,8 @@ A tiny macOS menu bar screenshot tool. Press the hotkey (or click the icon), **d
 
 ## Features / 功能
 
-- **Left-drag** selects a region, **right-click** captures the whole window under the cursor, `Esc` cancels
-  左键拖动框选区域，右键单击截取整个窗口，Esc 取消
+- **Left-drag** selects a region, **right-click** captures the whole window under the cursor (rendered on its own, so parts covered by other windows are included, no shadow; menus the app has open next to it are layered on top), `Esc` cancels
+  左键拖动框选区域，右键单击截取整个窗口（单独渲染，被其他窗口挡住的部分也完整，不带阴影；这个 App 在窗口旁展开的菜单会叠加进来），Esc 取消
 - Captures open menus, dropdowns and popovers: the moment you press the hotkey every screen is frozen with ScreenCaptureKit, the overlay shows that frozen image and the result is cropped from it. The overlay never takes focus, so other apps' menus stay open
   能截到展开的菜单、下拉框、弹出框：按下快捷键的瞬间用 ScreenCaptureKit 把每块屏幕冻结下来，选区遮罩显示这张冻结画面，结果从中裁剪；遮罩不会抢焦点，别的 App 的菜单不会被关掉
 - A Liquid Glass hint follows the cursor; the window under the cursor gets a Liquid Glass outline that glides between windows (macOS 26+). The rest of the screen is left untouched.
@@ -49,9 +49,9 @@ This builds and installs `~/Applications/QuickShot.app` and launches it. On the 
 
 ## Performance notes / 性能说明
 
-The freeze-frame is taken in parallel with showing the overlay (QuickShot's own windows are excluded from it), so the overlay still appears instantly; the frozen image arrives 70 ms (alone) to roughly 200–500 ms (while the overlay is appearing) later.
+The freeze-frame uses `SCScreenshotManager.captureImage(in:)` (~30 ms, about half of a filtered display capture). It can't exclude QuickShot's own windows, so the overlay is put in place fully transparent and revealed together with the frozen image: about 70 ms from hotkey to overlay in practice.
 
-冻结画面和弹出遮罩同时进行（拍屏时排除 QuickShot 自己的窗口），遮罩仍然是立刻出现；冻结画面单独拍约 70ms，和遮罩同时出现时约 200~500ms 后铺上。
+冻结画面用 `SCScreenshotManager.captureImage(in:)`（约 30ms，不到排除窗口的整屏拍法的一半）。它不能排除 QuickShot 自己的窗口，所以遮罩先透明就位，拍完和冻结画面一起显示：实测从按快捷键到遮罩出现约 70ms。
 
 The selection overlay is built once at launch and reused, all moving parts are plain `CALayer`s composited on the GPU, and the glass outline is animated with layer transforms (the glass shape is recomputed once it settles). Settings has an option to recompute the glass shape on every frame instead — more accurate highlights, more CPU.
 

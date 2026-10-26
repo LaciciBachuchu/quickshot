@@ -1,4 +1,5 @@
 import AppKit
+import ScreenCaptureKit
 import ServiceManagement
 import Carbon.HIToolbox
 
@@ -396,14 +397,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             registerHotKey()
         }
         _ = readyOverlay()   // 启动时就建好遮罩并预热，第一次截图也不卡
-        // 拍屏用的过滤器提前建好，并空拍一次预热：启动后第一次拍屏要 ~400ms，之后约 70ms
+        // 空拍一次、取一次窗口列表做预热：启动后第一次调用 ScreenCaptureKit 要几百毫秒
+        let screens = currentScreens()
         Task {
-            await ScreenFreezer.prepare()
-            _ = await ScreenFreezer.captureAll()
-        }
-        NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main) { _ in
-            ScreenFreezer.invalidate()
-            Task { await ScreenFreezer.prepare() }
+            _ = await ScreenFreezer.captureAll(screens)
+            _ = await ScreenFreezer.shareableWindows()
         }
     }
 
@@ -485,29 +483,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return o
     }
 
-    // 按快捷键那一刻开始的整屏预拍（遮罩同时出现，不等它拍完）
+    // 按快捷键那一刻开始的整屏预拍，以及右键截窗口要用的窗口列表
     var freezeTask: Task<[FrozenScreen], Never>?
-    var lastFreezeLatency: Double = 0   // 从按下到冻结画面就绪的耗时（毫秒）
+    var windowsTask: Task<SCShareableContent?, Never>?
+
+    func currentScreens() -> [(CGDirectDisplayID, CGRect)] {
+        NSScreen.screens.map { ($0.displayID, toCG($0.frame)) }
+    }
 
     @objc func capture() {
         guard !capturing else { return }  // 防止重复触发
         capturing = true
         thumbnail?.dismiss()
-        let t0 = CACurrentMediaTime()
-        let task = Task { await ScreenFreezer.captureAll() }
-        freezeTask = task
+        let freeze = Task { [screens = currentScreens()] in await ScreenFreezer.captureAll(screens) }
+        freezeTask = freeze
+        windowsTask = Task { await ScreenFreezer.shareableWindows() }
         // 左键拖选区域 / 右键选窗口，Esc 取消
         registerEsc()
         let overlay = readyOverlay()
-        overlay.begin { [weak self] target in
+        // 遮罩先透明就位，拍完（约 30ms）连同冻结画面一起显示
+        overlay.begin(hidden: true) { [weak self] target in
             guard let self else { return }
             self.unregisterEsc()
-            if let target { self.shoot(target) } else { self.capturing = false; self.freezeTask = nil }
+            if let target { self.shoot(target) } else { self.capturing = false; self.freezeTask = nil; self.windowsTask = nil }
         }
         Task { @MainActor in
-            let shots = await task.value
-            self.lastFreezeLatency = (CACurrentMediaTime() - t0) * 1000
-            overlay.showFrozen(shots)
+            overlay.showFrozen(await freeze.value)
+            overlay.reveal()
         }
     }
 
@@ -518,18 +520,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return saveDir.appendingPathComponent("截图 \(fmt.string(from: Date())).png")
     }
 
-    // 优先从冻结画面裁剪（能截到当时展开的菜单）；拍屏失败才退回实时截图
+    // 区域：从冻结画面裁剪（能截到当时展开的菜单）
+    // 窗口：窗口单独完整渲染（不受遮挡），再叠上冻结画面里它的菜单；单独渲染失败就退回按外框裁剪冻结画面
+    // 都不行才退回实时截图
     func shoot(_ target: CaptureTarget) {
         let file = newScreenshotURL()
-        let rect: CGRect
-        switch target {
-        case .region(let r): rect = r
-        case .window(_, let frame): rect = frame
-        }
-        let task = freezeTask
+        let freeze = freezeTask, windows = windowsTask
         freezeTask = nil
+        windowsTask = nil
         Task { @MainActor in
-            if let shots = await task?.value, let shot = ScreenFreezer.crop(shots, rect: rect), ScreenFreezer.writePNG(shot, to: file) {
+            let shots = await freeze?.value ?? []
+            var shot: FrozenScreen?
+            switch target {
+            case .region(let r):
+                shot = ScreenFreezer.crop(shots, rect: r)
+            case .window(let id, let frame, let popups):
+                if let content = await windows?.value, let img = await ScreenFreezer.captureWindow(id, in: content) {
+                    shot = ScreenFreezer.composeWindow(img, frame: frame, popups: popups, frozen: shots)
+                }
+                if shot == nil { shot = ScreenFreezer.crop(shots, rect: frame) }
+            }
+            if let shot, ScreenFreezer.writePNG(shot, to: file) {
                 NSSound(contentsOfFile: "/System/Library/Components/CoreAudio.component/Contents/SharedSupport/SystemSounds/system/Grab.aif",
                         byReference: true)?.play()
                 self.capturing = false
@@ -559,7 +570,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         switch target {
         case .region(let r):
             task.arguments = ["-R\(Int(r.minX.rounded())),\(Int(r.minY.rounded())),\(Int(r.width.rounded())),\(Int(r.height.rounded()))", file.path]
-        case .window(let id, _):
+        case .window(let id, _, _):
             task.arguments = ["-o", "-l\(id)", file.path]   // -o: 不带窗口阴影
         }
         task.terminationHandler = { _ in

@@ -1,16 +1,18 @@
 import AppKit
 
 // 自己的选区遮罩：左键拖动框选区域，右键单击截取鼠标下的窗口，Esc 取消
-// 系统的 screencapture -i 不支持右键，所以这里自己画遮罩，选好后再交给 screencapture -R / -l 截图
+// 系统的 screencapture -i 不支持右键，所以这里自己画遮罩，选好后从冻结画面裁剪（见 capture.swift）
 
 enum CaptureTarget {
-    case region(CGRect)       // 全局坐标，左上角为原点（screencapture -R 用的坐标）
-    case window(CGWindowID, CGRect)   // 窗口编号 + 外框（全局坐标，左上原点），从冻结画面里按外框裁剪
+    case region(CGRect)       // 全局坐标，左上角为原点
+    // 窗口编号 + 外框（全局坐标，左上原点）+ 按快捷键时这个 App 在窗口附近展开的菜单 / 下拉框
+    case window(CGWindowID, CGRect, popups: [CGRect])
 }
 
 struct WindowInfo {
     let id: CGWindowID
     let frame: CGRect         // 全局坐标，左上角为原点
+    var pid: pid_t = 0
 }
 
 // 主屏高度，用来在 Cocoa（左下原点）和 CG（左上原点）坐标之间换算
@@ -31,13 +33,33 @@ func visibleWindows() -> [WindowInfo] {
         as? [[String: Any]] ?? []
     return list.compactMap { info in
         guard (info[kCGWindowLayer as String] as? Int) == 0,
-              (info[kCGWindowOwnerPID as String] as? Int32) != me,
+              let pid = info[kCGWindowOwnerPID as String] as? Int32, pid != me,
               (info[kCGWindowAlpha as String] as? Double ?? 1) > 0,
               let id = info[kCGWindowNumber as String] as? CGWindowID,
               let b = info[kCGWindowBounds as String] as? NSDictionary,
               let frame = CGRect(dictionaryRepresentation: b),
               frame.width > 20, frame.height > 20 else { return nil }
-        return WindowInfo(id: id, frame: frame)
+        return WindowInfo(id: id, frame: frame, pid: pid)
+    }
+}
+
+// 屏幕上的弹出层窗口（菜单、下拉框、弹出框等，层级高于普通窗口），不含菜单栏、程序坞和本程序
+func popupWindows() -> [WindowInfo] {
+    let me = ProcessInfo.processInfo.processIdentifier
+    let skip: Set<Int> = [Int(CGWindowLevelForKey(.dockWindow)), Int(CGWindowLevelForKey(.mainMenuWindow)),
+                          Int(CGWindowLevelForKey(.statusWindow))]
+    let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
+        as? [[String: Any]] ?? []
+    return list.compactMap { info in
+        guard let layer = info[kCGWindowLayer as String] as? Int, layer > 0, !skip.contains(layer),
+              layer < Int(CGShieldingWindowLevel()),
+              let pid = info[kCGWindowOwnerPID as String] as? Int32, pid != me,
+              (info[kCGWindowAlpha as String] as? Double ?? 1) > 0,
+              let id = info[kCGWindowNumber as String] as? CGWindowID,
+              let b = info[kCGWindowBounds as String] as? NSDictionary,
+              let frame = CGRect(dictionaryRepresentation: b),
+              frame.width > 4, frame.height > 4 else { return nil }
+        return WindowInfo(id: id, frame: frame, pid: pid)
     }
 }
 
@@ -573,16 +595,25 @@ final class SelectionOverlay {
         }
     }
 
-    func begin(completion: @escaping (CaptureTarget?) -> Void) {
+    var popups: [WindowInfo] = []
+
+    // hidden = true：遮罩先完全透明地就位（拍屏用的 captureImage(in:) 不能排除本程序窗口），拍完再 reveal()
+    func begin(hidden: Bool = false, completion: @escaping (CaptureTarget?) -> Void) {
         targets = visibleWindows()   // 遮罩出现前先记下窗口位置
+        popups = popupWindows()
         self.completion = completion
         finished = false
         for w in windows {
-            w.alphaValue = 1
+            w.alphaValue = hidden ? 0 : 1
             w.ignoresMouseEvents = false
         }
         views.forEach { $0.reset() }
         show()
+    }
+
+    func reveal() {
+        guard !finished else { return }
+        windows.forEach { $0.alphaValue = 1 }
     }
 
     func show() {
@@ -623,7 +654,9 @@ final class SelectionOverlay {
 
     func pickWindow(at point: NSPoint) {
         guard let w = window(at: point) else { NSSound.beep(); return }   // 桌面空白处没有窗口
-        finish(.window(w.id, w.frame))
+        // 同一个 App 在这个窗口附近展开的菜单 / 下拉框一起带上
+        let near = w.frame.insetBy(dx: -40, dy: -40)
+        finish(.window(w.id, w.frame, popups: popups.filter { $0.pid == w.pid && $0.frame.intersects(near) }.map(\.frame)))
     }
 
     func finish(_ target: CaptureTarget?) {
