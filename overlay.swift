@@ -603,17 +603,24 @@ final class SelectionOverlay {
         popups = popupWindows()
         self.completion = completion
         finished = false
-        for w in windows {
-            w.alphaValue = hidden ? 0 : 1
-            w.ignoresMouseEvents = false
-        }
+        fadeGeneration += 1
+        setAlpha(hidden ? 0 : 1)
+        for w in windows { w.ignoresMouseEvents = false }
         views.forEach { $0.reset() }
         show()
     }
 
     func reveal() {
         guard !finished else { return }
-        windows.forEach { $0.alphaValue = 1 }
+        setAlpha(1)
+    }
+
+    // 用 0 时长的动画来设，能打断上一次还没结束的淡出
+    func setAlpha(_ a: CGFloat) {
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = 0
+            for w in windows { w.animator().alphaValue = a }
+        }
     }
 
     func show() {
@@ -659,19 +666,29 @@ final class SelectionOverlay {
         finish(.window(w.id, w.frame, popups: popups.filter { $0.pid == w.pid && $0.frame.intersects(near) }.map(\.frame)))
     }
 
+    var fadeGeneration = 0
+
+    // 退出时淡出而不是瞬间撤掉：冻结画面和实时画面之间的差别（玻璃轮廓、提示、截图期间变了的内容）
+    // 一帧内跳变看起来就是“闪一下”，淡出 0.15 秒就平滑过渡过去了
     func finish(_ target: CaptureTarget?) {
         guard !finished else { return }
         finished = true
-        for w in windows { w.orderOut(nil) }
-        views.forEach { $0.pause() }
+        fadeGeneration += 1
+        let gen = fadeGeneration
+        for w in windows { w.ignoresMouseEvents = true }   // 淡出期间点击直接穿透
         NSCursor.arrow.set()
+        NSAnimationContext.runAnimationGroup({ ctx in
+            ctx.duration = 0.15
+            ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            for w in windows { w.animator().alphaValue = 0 }
+        }, completionHandler: { [weak self] in
+            guard let self, self.finished, self.fadeGeneration == gen else { return }   // 淡出途中又开始截图了
+            for w in self.windows { w.orderOut(nil) }
+            self.views.forEach { $0.pause() }
+        })
         let done = completion
         completion = nil
-        guard target != nil else {
-            done?(nil)
-            return
-        }
-        // 等遮罩真正从屏幕上消失再截图，否则会把遮罩也截进去
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) { done?(target) }
+        // 结果从冻结画面裁剪 / 单独渲染窗口，都不受遮罩影响，不用等它消失
+        done?(target)
     }
 }

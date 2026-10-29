@@ -1,4 +1,5 @@
 import AppKit
+import AudioToolbox
 import ScreenCaptureKit
 import ServiceManagement
 import Carbon.HIToolbox
@@ -523,6 +524,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // 区域：从冻结画面裁剪（能截到当时展开的菜单）
     // 窗口：窗口单独完整渲染（不受遮挡），再叠上冻结画面里它的菜单；单独渲染失败就退回按外框裁剪冻结画面
     // 都不行才退回实时截图
+    // 快门声用系统音效接口异步播放：NSSound 加载和播放（音频设备休眠时要先唤醒）会在主线程卡 100~800ms，
+    // 遮罩淡出就会卡住再跳变
+    let grabSound: SystemSoundID = {
+        var id: SystemSoundID = 0
+        AudioServicesCreateSystemSoundID(URL(fileURLWithPath: "/System/Library/Components/CoreAudio.component/Contents/SharedSupport/SystemSounds/system/Grab.aif") as CFURL, &id)
+        return id
+    }()
+
     func shoot(_ target: CaptureTarget) {
         let file = newScreenshotURL()
         let freeze = freezeTask, windows = windowsTask
@@ -540,9 +549,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
                 if shot == nil { shot = ScreenFreezer.crop(shots, rect: frame) }
             }
-            if let shot, ScreenFreezer.writePNG(shot, to: file) {
-                NSSound(contentsOfFile: "/System/Library/Components/CoreAudio.component/Contents/SharedSupport/SystemSounds/system/Grab.aif",
-                        byReference: true)?.play()
+            // PNG 编码放后台线程（整屏约 30ms），主线程留给遮罩淡出动画
+            let saved = await Task.detached { shot.map { ScreenFreezer.writePNG($0, to: file) } ?? false }.value
+            if saved {
+                AudioServicesPlaySystemSound(self.grabSound)
                 self.capturing = false
                 self.didCapture(file)
             } else {
@@ -579,7 +589,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.didCapture(file)
             }
         }
-        do { try task.run() } catch { capturing = false }
+        // 实时截图要等遮罩淡出完，否则会把遮罩也截进去
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+            do { try task.run() } catch { self.capturing = false }
+        }
     }
 
 
